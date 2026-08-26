@@ -6,6 +6,8 @@ import re
 import sqlite3
 from pathlib import Path
 
+from .profiles import profile_label
+
 
 def _safe_name(value: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._~-]+", "_", value)
@@ -69,7 +71,7 @@ def generate_dataset_reports(conn: sqlite3.Connection, report_dir: Path) -> Path
                     else ("YES" if row["conforms"] else "NO")
                 )
                 f.write(
-                    f"| `{row['shape_model']}` | {state} | {row['violations']} | "
+                    f"| {profile_label(row['shape_model'])} (`{row['shape_model']}`) | {state} | {row['violations']} | "
                     f"{row['warnings']} | {row['infos']} | {row['results']} | "
                     f"{row['http_status']} |\n"
                 )
@@ -175,7 +177,7 @@ def generate_summary(conn: sqlite3.Connection, report_dir: Path) -> tuple[Path, 
                 pct = (100.0 * row["compliant"] / denominator) if denominator else None
                 pct_text = f"{pct:.2f}%" if pct is not None else "n/a"
                 f.write(
-                    f"| `{row['shape_model']}` | {row['tested']} | {row['compliant']} | "
+                    f"| {profile_label(row['shape_model'])} (`{row['shape_model']}`) | {row['tested']} | {row['compliant']} | "
                     f"{row['non_compliant']} | {row['errors']} | {pct_text} | "
                     f"{row['violations']} | {row['warnings']} | {row['infos']} |\n"
                 )

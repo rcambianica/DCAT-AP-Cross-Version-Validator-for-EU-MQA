@@ -24,12 +24,24 @@ BUILTIN_PROFILES = [
     "dcatap210",
     "dcatap201",
     "dcatap200",
+    "dcatap200conventions",
     "dcatap121",
     "dcatap121orig",
     "dcatap12",
     "dcatap11",
     "dcatap11orig",
 ]
+
+
+PROFILE_LABELS = {
+    "dcatap200": "DCAT-AP 2.0.0",
+    "dcatap200conventions": "DCAT-AP 2.0.0 Conventions",
+}
+
+
+def profile_label(profile: str) -> str:
+    """Etichetta leggibile per i profili che richiedono disambiguazione."""
+    return PROFILE_LABELS.get(profile, profile)
 
 
 PROFILE_RE = re.compile(
