@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
 
-# Profili osservati/esposti dalla versione corrente del validatore data.europa.eu
-# usata per questo progetto. La lista incorporata elimina la dipendenza da un
-# checkout locale di validating-shacl.
+# Fallback: profili osservati nel servizio data.europa.eu / validating-shacl.
+# Quando possibile, per questa analisi e' preferibile usare l'OpenAPI della
+# stessa istanza locale che esegue il validator.
 BUILTIN_PROFILES = [
     "dcatap301level1",
     "dcatap301level2",
@@ -32,7 +33,6 @@ BUILTIN_PROFILES = [
     "dcatap11orig",
 ]
 
-
 PROFILE_LABELS = {
     "dcatap200": "DCAT-AP 2.0.0",
     "dcatap200conventions": "DCAT-AP 2.0.0 Conventions",
@@ -40,62 +40,105 @@ PROFILE_LABELS = {
 
 
 def profile_label(profile: str) -> str:
-    """Etichetta leggibile per i profili che richiedono disambiguazione."""
     return PROFILE_LABELS.get(profile, profile)
 
 
+# Accetta sia gli identificativi dcatap... sia gli storici shapes....
 PROFILE_RE = re.compile(
-    r"\b(?:dcatap|shapes)\d+(?:level[123]|orig|conventions)?\b",
+    r"\b(?:dcatap|shapes)[A-Za-z0-9_-]*(?:level[123]|orig|conventions)?\b",
     re.IGNORECASE,
 )
 
+# Percorsi tipici del checkout/build locale di validating-shacl.
+DEFAULT_OPENAPI_PATHS = [
+    Path("src/main/resources/webroot/openapi-shacl.yaml"),
+    Path("src/main/resources/webroot/openapi-shacl.yml"),
+    Path("/opt/mqa/validating-shacl/src/main/resources/webroot/openapi-shacl.yaml"),
+    Path("/opt/mqa/validating-shacl/src/main/resources/webroot/openapi-shacl.yml"),
+]
 
-def discover_profiles(openapi_path: Path | None = None) -> list[str]:
-    """Restituisce i profili disponibili per la cross-version analysis.
 
-    Se viene fornito un file OpenAPI locale esistente, prova a ricavare i profili
-    da quello. In caso contrario usa la lista incorporata, così il progetto può
-    funzionare senza installare validating-shacl localmente.
+def _extract_profiles(text: str) -> list[str]:
+    """Estrae gli shapeModel da un OpenAPI senza richiedere PyYAML.
+
+    Il file puo' contenere piu' enum o riferimenti; manteniamo solo valori che
+    assomigliano a shapeModel DCAT-AP e preserviamo l'ordine di apparizione.
     """
-    if openapi_path is None:
-        return BUILTIN_PROFILES.copy()
-
-    if not openapi_path.is_file():
-        raise FileNotFoundError(f"OpenAPI not found: {openapi_path}")
-
-    text = openapi_path.read_text(encoding="utf-8")
     profiles: list[str] = []
     seen: set[str] = set()
 
     for match in PROFILE_RE.finditer(text):
         profile = match.group(0)
-        if profile not in seen:
-            seen.add(profile)
-            profiles.append(profile)
+        if profile.lower() in seen:
+            continue
+        seen.add(profile.lower())
+        profiles.append(profile)
 
     return profiles
 
 
-def level1_profiles(profiles: list[str]) -> list[str]:
-    """Selezione operativa per il confronto tra generazioni DCAT-AP.
+def find_openapi_path(explicit: Path | None = None) -> Path | None:
+    """Trova l'OpenAPI locale se disponibile.
 
-    Per le versioni moderne seleziona i profili Level 1. Per le versioni storiche,
-    che non espongono sempre la stessa suddivisione a livelli, mantiene gli shape
-    set non-`orig`. Non implica equivalenza metodologica perfetta tra 1.x e 2/3.x.
+    Priorita': argomento CLI, variabile MQA_SHACL_OPENAPI, percorsi standard.
+    """
+    if explicit is not None:
+        if not explicit.is_file():
+            raise FileNotFoundError(f"OpenAPI not found: {explicit}")
+        return explicit
+
+    env_path = os.environ.get("MQA_SHACL_OPENAPI")
+    if env_path:
+        path = Path(env_path).expanduser()
+        if not path.is_file():
+            raise FileNotFoundError(f"MQA_SHACL_OPENAPI not found: {path}")
+        return path
+
+    for path in DEFAULT_OPENAPI_PATHS:
+        if path.is_file():
+            return path
+
+    return None
+
+
+def discover_profiles(openapi_path: Path | None = None) -> list[str]:
+    """Restituisce i profili dell'istanza locale, quando l'OpenAPI e' disponibile.
+
+    Se non viene trovato un OpenAPI locale, usa il fallback incorporato. Questo
+    evita di bloccare l'analisi, ma la lista fallback va considerata meno
+    autorevole della configurazione della specifica istanza locale.
+    """
+    path = find_openapi_path(openapi_path)
+    if path is None:
+        return BUILTIN_PROFILES.copy()
+
+    profiles = _extract_profiles(path.read_text(encoding="utf-8"))
+    if not profiles:
+        raise ValueError(f"Nessun shapeModel DCAT-AP trovato in {path}")
+    return profiles
+
+
+def level1_profiles(profiles: list[str]) -> list[str]:
+    """Seleziona i profili Level 1 quando disponibili.
+
+    Per le versioni storiche che non espongono Level 1/2/3, mantiene il profilo
+    base non-orig. Non assume che shape set storici e moderni siano metodologicamente
+    equivalenti.
     """
     selected: list[str] = []
+    lower = [p.lower() for p in profiles]
+
     for p in profiles:
         low = p.lower()
-        if "orig" in low:
+        if "orig" in low or "conventions" in low:
             continue
         if "level1" in low:
             selected.append(p)
             continue
         if not any(tag in low for tag in ("level2", "level3")):
-            # Evita di aggiungere il profilo completo di una versione moderna se
-            # esiste gia' il corrispondente level1.
             base = re.sub(r"level[123]$", "", low)
-            has_level1 = any(q.lower() == f"{base}level1" for q in profiles)
+            has_level1 = any(q == f"{base}level1" for q in lower)
             if not has_level1:
                 selected.append(p)
+
     return selected

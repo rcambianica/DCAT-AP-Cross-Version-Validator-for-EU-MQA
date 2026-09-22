@@ -6,7 +6,7 @@ from pathlib import Path
 from .config import Config
 from .db import connect
 from .hub import HubClient, save_rdf, sha256_bytes
-from .profiles import discover_profiles, level1_profiles
+from .profiles import discover_profiles, find_openapi_path, level1_profiles
 from .reporting import generate_dataset_reports, generate_summary
 from .validator import ShaclValidatorClient
 
@@ -53,7 +53,7 @@ def discover(cfg: Config, limit: int | None) -> None:
     print(f"Dataset discovered in this run: {count}")
 
 
-def fetch(cfg: Config, retry_errors: bool = False) -> None:
+def fetch(cfg: Config, retry_errors: bool = False, limit: int | None = None) -> None:
     client = HubClient(cfg.hub_base_url, cfg.request_timeout)
     conn = connect(cfg.db_path)
 
@@ -61,9 +61,12 @@ def fetch(cfg: Config, retry_errors: bool = False) -> None:
     if not retry_errors:
         condition += " AND (fetch_status IS NULL OR fetch_status != 'error')"
 
-    rows = conn.execute(
-        f"SELECT dataset_id FROM datasets WHERE {condition} ORDER BY dataset_id"
-    ).fetchall()
+    sql = f"SELECT dataset_id FROM datasets WHERE {condition} ORDER BY dataset_id"
+    params: tuple = ()
+    if limit is not None:
+        sql += " LIMIT ?"
+        params = (limit,)
+    rows = conn.execute(sql, params).fetchall()
 
     for idx, row in enumerate(rows, start=1):
         dataset_id = row["dataset_id"]
@@ -106,8 +109,10 @@ def validate(
     all_profiles: bool,
     revalidate: bool = False,
     explicit_profiles: str | None = None,
+    limit: int | None = None,
 ) -> None:
-    profiles = discover_profiles(cfg.openapi_path)
+    openapi = find_openapi_path(cfg.openapi_path)
+    profiles = discover_profiles(openapi)
     if explicit_profiles:
         requested = [p.strip() for p in explicit_profiles.split(",") if p.strip()]
         unknown = [p for p in requested if p not in profiles]
@@ -121,6 +126,7 @@ def validate(
         raise SystemExit("No DCAT-AP profiles selected")
 
     print(f"Validator: {cfg.validator_url}")
+    print(f"Profile source: {openapi if openapi else 'built-in fallback'}")
     print("Profiles:")
     for profile in profiles:
         print(f"  - {profile}")
@@ -132,9 +138,12 @@ def validate(
         retries=cfg.request_retries,
     )
     conn = connect(cfg.db_path)
-    datasets = conn.execute(
-        "SELECT dataset_id, rdf_path FROM datasets WHERE fetch_status = 'ok' ORDER BY dataset_id"
-    ).fetchall()
+    sql = "SELECT dataset_id, rdf_path FROM datasets WHERE fetch_status = 'ok' ORDER BY dataset_id"
+    params: tuple = ()
+    if limit is not None:
+        sql += " LIMIT ?"
+        params = (limit,)
+    datasets = conn.execute(sql, params).fetchall()
 
     total = len(datasets) * len(profiles)
     current = 0
@@ -206,16 +215,16 @@ def add_common(parser: argparse.ArgumentParser) -> None:
         "--validator",
         default=defaults.validator_url,
         help=(
-            "SHACL validation endpoint. Default: public data.europa.eu API. "
-            "For a local instance use http://127.0.0.1:8080/shacl/validation/report"
+            "SHACL validation endpoint. Default: local validating-shacl at "
+            "http://127.0.0.1:8080/shacl/validation/report"
         ),
     )
     parser.add_argument(
         "--openapi",
         default=None,
         help=(
-            "Optional local openapi-shacl.yaml used to discover profiles. "
-            "If omitted, built-in profiles are used."
+            "Local openapi-shacl.yaml used to discover profiles. If omitted, "
+            "the project tries standard local paths and then the built-in fallback."
         ),
     )
     parser.add_argument("--db", default=str(defaults.db_path))
@@ -227,13 +236,13 @@ def add_common(parser: argparse.ArgumentParser) -> None:
         "--request-delay",
         type=float,
         default=defaults.request_delay,
-        help="Seconds between SHACL API requests (default: 0.25 for public service)",
+        help="Seconds between SHACL requests (default: 0 for local service)",
     )
     parser.add_argument(
         "--retries",
         type=int,
         default=defaults.request_retries,
-        help="Retries for 429/5xx responses",
+        help="Retries for 429/5xx responses (default: 0 for local service)",
     )
 
 
@@ -247,6 +256,7 @@ def main() -> None:
 
     p_fetch = sub.add_parser("fetch")
     add_common(p_fetch)
+    p_fetch.add_argument("--limit", type=int)
     p_fetch.add_argument("--retry-errors", action="store_true")
 
     p_validate = sub.add_parser("validate")
@@ -261,6 +271,7 @@ def main() -> None:
         help="Comma-separated explicit shapeModel list, e.g. dcatap300level1,dcatap301level1",
     )
     p_validate.add_argument("--revalidate", action="store_true")
+    p_validate.add_argument("--limit", type=int)
 
     p_report = sub.add_parser("report")
     add_common(p_report)
@@ -280,9 +291,9 @@ def main() -> None:
     if args.command == "discover":
         discover(cfg, args.limit)
     elif args.command == "fetch":
-        fetch(cfg, args.retry_errors)
+        fetch(cfg, args.retry_errors, args.limit)
     elif args.command == "validate":
-        validate(cfg, args.all_profiles, args.revalidate, args.profiles)
+        validate(cfg, args.all_profiles, args.revalidate, args.profiles, args.limit)
     elif args.command == "report":
         report(cfg)
     elif args.command == "run":

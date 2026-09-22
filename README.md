@@ -3,19 +3,39 @@
 Analisi della conformità cross-version DCAT-AP dei metadati del catalogo
 `dati-gov-it` così come presenti nel piveau Hub di data.europa.eu.
 
-Per default il progetto usa direttamente il **servizio SHACL pubblico di
-data.europa.eu**:
+La pipeline separa volutamente **sorgente dei metadata** e **validator SHACL**:
 
 ```text
-https://data.europa.eu/api/mqa/shacl/validation/report/
+data.europa.eu / piveau Hub
+          |
+          v
+    discovery dataset
+          |
+          v
+       fetch RDF
+          |
+          v
+  validating-shacl LOCALE
+          |
+          v
+      SQLite + reports
 ```
 
-Non è quindi necessario installare `validating-shacl` localmente.
+Per default il progetto usa il validator locale:
+
+```text
+http://127.0.0.1:8080/shacl/validation/report
+```
+
+Il servizio pubblico di data.europa.eu non viene usato per la validazione, ma il
+piveau Hub europeo continua a essere usato per recuperare i metadata del catalogo
+`dati-gov-it`.
 
 ## Requisiti
 
 - Python 3.11+
-- accesso Internet verso `data.europa.eu`
+- accesso Internet verso `data.europa.eu` per discovery/fetch dei metadata
+- un'istanza locale di `validating-shacl` raggiungibile sulla porta 8080
 
 ## Installazione
 
@@ -25,63 +45,87 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Primo test consigliato
+## Test minimo consigliato
 
-Eseguire inizialmente un campione piccolo:
+Prima verificare direttamente il validator locale con un TTL già disponibile:
 
 ```bash
-python -m mqa_cv run --limit 10
+curl -sS \
+  -o /tmp/report.ttl \
+  -w 'HTTP %{http_code}\n' \
+  -X POST \
+  'http://127.0.0.1:8080/shacl/validation/report?shapeModel=dcatap300level1' \
+  -H 'Content-Type: text/turtle' \
+  -H 'Accept: text/turtle' \
+  --data-binary '@/home/riccardo/bologna.ttl'
 ```
 
-La pipeline esegue:
+Se il validator risponde correttamente, il test del progetto può essere eseguito
+con un solo dataset:
 
-```text
-data.europa.eu Hub
-       |
-       v
- discovery
-       |
-       v
- fetch RDF
-       |
-       v
- data.europa.eu SHACL API
-       |
-       v
- SQLite + reports
+```bash
+python -m mqa_cv run --limit 1
 ```
+
+`--limit 1` ora limita **l'intera pipeline**: discovery, fetch e validation. Non
+verranno quindi processati eventuali dataset rimasti nel database da esecuzioni
+precedenti.
+
+## Profili locali
+
+Quando possibile il progetto usa l'`openapi-shacl.yaml` della stessa installazione
+locale di `validating-shacl`, così la lista degli `shapeModel` è coerente con la
+versione realmente in esecuzione.
+
+È possibile indicare esplicitamente il file:
+
+```bash
+python -m mqa_cv validate \
+  --openapi /opt/mqa/validating-shacl/src/main/resources/webroot/openapi-shacl.yaml
+```
+
+Oppure tramite variabile d'ambiente:
+
+```bash
+export MQA_SHACL_OPENAPI=/opt/mqa/validating-shacl/src/main/resources/webroot/openapi-shacl.yaml
+```
+
+Se `--openapi` non viene specificato, vengono cercati automaticamente alcuni
+percorsi standard. Se nessuno esiste, viene usata una lista incorporata di
+fallback. Il programma stampa sempre quale sorgente dei profili sta utilizzando.
 
 ## Comandi
 
-Solo discovery:
+Discovery:
 
 ```bash
 python -m mqa_cv discover --limit 100
 ```
 
-Fetch dei metadati già scoperti:
+Fetch dei metadata già scoperti:
 
 ```bash
-python -m mqa_cv fetch
+python -m mqa_cv fetch --limit 100
 ```
 
-Validazione cross-version con il servizio UE:
+Validazione del primo dataset disponibile:
 
 ```bash
-python -m mqa_cv validate
+python -m mqa_cv validate --limit 1
 ```
 
-Validazione di tutti i profili incorporati:
+Validazione di tutti i profili disponibili:
 
 ```bash
-python -m mqa_cv validate --all-profiles
+python -m mqa_cv validate --all-profiles --limit 1
 ```
 
 Validazione di profili espliciti:
 
 ```bash
 python -m mqa_cv validate \
-  --profiles dcatap211level1,dcatap300level1,dcatap301level1
+  --profiles dcatap211level1,dcatap300level1,dcatap301level1 \
+  --limit 1
 ```
 
 Rigenerazione dei report:
@@ -90,68 +134,64 @@ Rigenerazione dei report:
 python -m mqa_cv report
 ```
 
-## Validatore locale opzionale
+## Timeout e retry
 
-Il backend resta configurabile. Per confrontare il servizio UE con una tua istanza
-locale puoi eseguire:
+Per il validator locale i valori predefiniti sono volutamente conservativi:
 
-```bash
-python -m mqa_cv validate \
-  --validator http://127.0.0.1:8080/shacl/validation/report
+```text
+timeout       = 30 s
+request_delay = 0 s
+retries       = 0
 ```
 
-Il database distingue i risultati tramite la tripla:
+Questo evita che un validator locale non raggiungibile rimanga apparentemente
+bloccato per diversi minuti a causa di retry e backoff.
+
+I valori possono essere modificati dalla CLI, per esempio:
+
+```bash
+python -m mqa_cv validate --timeout 60 --retries 1
+```
+
+## Errori del validator
+
+Un errore HTTP o di rete non viene interpretato come non-compliance:
+
+```text
+HTTP 200 + sh:conforms=true   -> COMPLIANT
+HTTP 200 + sh:conforms=false  -> NON_COMPLIANT
+HTTP 4xx/5xx                  -> VALIDATOR_ERROR
+errore di rete                -> VALIDATOR_ERROR
+report RDF non interpretabile -> VALIDATOR_ERROR
+```
+
+La fonte autorevole della conformità è `sh:conforms`; il numero di
+`sh:Violation` viene registrato separatamente.
+
+## Database
+
+`analysis.db` distingue i risultati mediante:
 
 ```text
 (dataset_id, shape_model, validator_url)
 ```
 
-quindi risultati locali e UE possono convivere nello stesso `analysis.db` senza
-essere confusi. I report vengono raggruppati per endpoint del validatore.
-
-## Profili
-
-Il progetto contiene una lista incorporata dei profili DCAT-AP usati per la
-cross-version analysis. Questo elimina la dipendenza da un checkout locale di
-`validating-shacl`.
-
-Se vuoi invece ricavare i profili da uno specifico checkout/versione del server:
-
-```bash
-python -m mqa_cv validate \
-  --openapi /opt/mqa/validating-shacl/src/main/resources/webroot/openapi-shacl.yaml
-```
-
-## Rate limiting e retry
-
-Il servizio UE è pubblico. Il client inserisce per default un intervallo di 0,25 s
-tra le richieste e ritenta automaticamente le risposte 429 e alcuni errori 5xx.
-
-Puoi aumentare l'intervallo:
-
-```bash
-python -m mqa_cv validate --request-delay 1.0
-```
-
-Per un'analisi dell'intero catalogo, il numero di richieste può diventare molto
-elevato (`dataset × profili`). Il servizio pubblico è appropriato per campioni e
-verifiche comparative; per batch molto grandi è metodologicamente preferibile usare
-un'istanza locale della stessa release/configurazione oppure definire esplicitamente
-una politica di carico compatibile con il servizio pubblico.
+È quindi possibile conservare nello stesso database risultati ottenuti da
+validator differenti senza confonderli.
 
 ## Output
 
-- `analysis.db`: SQLite con dataset, validazioni e provenienza del validatore
+- `analysis.db`: SQLite con dataset, validazioni e provenienza del validator
 - `data/rdf/*.ttl`: grafi RDF recuperati dal piveau Hub
 - `reports/datasets/*.md`: report per dataset
-- `reports/summary.csv`: aggregazione per validatore e profilo
+- `reports/summary.csv`: aggregazione per validator e profilo
 - `reports/summary.md`: report generale
 
 ## Nota metodologica
 
-Il risultato `sh:conforms` del report RDF è la fonte autorevole per la conformità.
-`sh:Violation`, `sh:Warning` e `sh:Info` vengono conteggiati separatamente.
+Il progetto non scarica direttamente i metadata da `dati.gov.it`. I metadata sono
+quelli del catalogo `dati-gov-it` presenti nel piveau Hub di data.europa.eu.
 
-La selezione cross-version predefinita usa i profili `level1` quando disponibili.
-Per le versioni storiche 1.x la comparabilità metodologica degli shape set deve
-essere trattata separatamente e non viene assunta automaticamente.
+Questa scelta permette di mantenere costante la sorgente RDF mentre si cambia
+soltanto il validator/shape model. Un eventuale confronto con il CKAN originale
+di `dati.gov.it` costituisce un esperimento separato.
