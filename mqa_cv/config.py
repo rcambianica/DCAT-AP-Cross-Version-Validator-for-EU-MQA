@@ -14,7 +14,7 @@ class Config:
     catalogue_id: str = "dati-gov-it"
 
     # Network and pagination parameters.
-    page_size: int = 100
+    page_size: int = 1000
     timeout: int = 60
 
     # Filesystem paths.
@@ -23,4 +23,4 @@ class Config:
     db_path: Path = Path("analysis.db")
 
     # Local SHACL validator.
-    validator_url: str = "http://127.0.0.1:8080/shacl/validation/report"
+    validator_url: str = "http://192.168.122.221:8080/shacl/validation/report"

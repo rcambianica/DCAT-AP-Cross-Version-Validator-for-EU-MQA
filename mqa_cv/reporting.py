@@ -110,7 +110,7 @@ def generate_summary(conn: sqlite3.Connection, report_dir: Path) -> tuple[Path, 
         SELECT
             COUNT(*) AS discovered,
             SUM(CASE WHEN fetch_status = 'ok' THEN 1 ELSE 0 END) AS fetched,
-            SUM(CASE WHEN fetch_status = 'error' THEN 1 ELSE 0 END) AS fetch_errors
+            SUM(CASE WHEN fetch_status IN ('error','fetch_error') THEN 1 ELSE 0 END) AS fetch_errors
         FROM datasets
         """
     ).fetchone()
@@ -156,7 +156,9 @@ def generate_summary(conn: sqlite3.Connection, report_dir: Path) -> tuple[Path, 
         f.write("## Acquisition\n\n")
         f.write(f"- Dataset discovered: **{fetch['discovered'] or 0}**\n")
         f.write(f"- RDF fetched: **{fetch['fetched'] or 0}**\n")
-        f.write(f"- Fetch errors: **{fetch['fetch_errors'] or 0}**\n\n")
+        f.write(f"- Fetch errors: **{fetch['fetch_errors'] or 0}**\n")
+        status_counts = conn.execute("SELECT validation_status, COUNT(*) AS n FROM datasets GROUP BY validation_status ORDER BY validation_status").fetchall()
+        f.write("- Validation status: " + ", ".join(f"{r['validation_status']}={r['n']}" for r in status_counts) + "\n\n")
 
         validators = []
         for row in rows:

@@ -23,7 +23,7 @@ data.europa.eu / piveau Hub
 Per default il progetto usa il validator locale:
 
 ```text
-http://127.0.0.1:8080/shacl/validation/report
+http://192.168.122.221:8080/shacl/validation/report
 ```
 
 Il servizio pubblico di data.europa.eu non viene usato per la validazione, ma il piveau Hub europeo continua a essere usato per recuperare i
@@ -52,7 +52,7 @@ curl -sS \
   -o /tmp/report.ttl \
   -w 'HTTP %{http_code}\n' \
   -X POST \
-  'http://127.0.0.1:8080/shacl/validation/report?shapeModel=dcatap300level1' \
+  'http://192.168.122.221:8080/shacl/validation/report?shapeModel=dcatap300level1' \
   -H 'Content-Type: text/turtle' \
   -H 'Accept: text/turtle' \
   --data-binary '@/home/riccardo/bologna.ttl'
@@ -88,45 +88,36 @@ export MQA_SHACL_OPENAPI=/opt/mqa/validating-shacl/src/main/resources/webroot/op
 Se `--openapi` non viene specificato, vengono cercati automaticamente alcuni percorsi standard. Se nessuno esiste, viene usata una lista
 incorporata di fallback. Il programma stampa sempre quale sorgente dei profili sta utilizzando.
 
-## Comandi
+## Pipeline incrementale
 
-Discovery:
+Il database mantiene un inventario persistente degli ID. `discover` aggiorna l'inventario senza scaricare RDF; `run` aggiorna automaticamente l'inventario e poi lavora sui dataset ancora da acquisire/validare. Gli ID sono ordinati localmente in modo deterministico per `dataset_id` crescente. Gli ID già presenti non vengono duplicati e i loro stati non vengono azzerati.
 
-```bash
-python -m mqa_cv discover --limit 100
-```
-
-Fetch dei metadata già scoperti:
+### Aggiornare soltanto l'inventario
 
 ```bash
-python -m mqa_cv fetch --limit 100
+python -m mqa_cv discover
 ```
 
-Validazione del primo dataset disponibile:
+Per un test limitato: `python -m mqa_cv discover --limit 10`. Il limite limita gli ID aggiunti dalla scansione, non effettua fetch o validazioni.
+
+### Run incrementale completa
 
 ```bash
-python -m mqa_cv validate --limit 1
+python -m mqa_cv run --limit 100
 ```
 
-Validazione di tutti i profili disponibili:
+La `run` esegue in sequenza: (1) discovery/aggiornamento inventario, (2) fetch fino a 100 dataset in coda, (3) validazione fino a 100 dataset con RDF acquisito e validazione in attesa, (4) rigenerazione report. Il limite si applica separatamente alle fasi di fetch e validazione.
+
+Per usare soltanto l'inventario già presente senza interrogare Hub Search: `python -m mqa_cv run --no-discover --limit 100`.
+
+### Comandi disponibili
 
 ```bash
-python -m mqa_cv validate --all-profiles --limit 1
+python -m mqa_cv discover [--limit N] [--catalogue ID]
+python -m mqa_cv run [--limit N] [--catalogue ID] [--no-discover]
 ```
 
-Validazione di profili espliciti:
-
-```bash
-python -m mqa_cv validate \
-  --profiles dcatap211level1,dcatap300level1,dcatap301level1 \
-  --limit 1
-```
-
-Rigenerazione dei report:
-
-```bash
-python -m mqa_cv report
-```
+Gli errori di fetch e validazione rimangono registrati con stati distinti e possono essere ritentati nelle run successive. Un dataset è marcato `completed` soltanto quando tutti i profili configurati hanno restituito un esito interpretabile con HTTP 200.
 
 ## Timeout e retry
 
@@ -185,3 +176,10 @@ di data.europa.eu.
 
 Questa scelta permette di mantenere costante la sorgente RDF mentre si cambia soltanto il validator/shape model. Un eventuale confronto con
 il CKAN originale di `dati.gov.it` costituisce un esperimento separato.
+
+
+### Recupero completo degli ID tramite Scroll API
+
+La discovery usa la modalità scroll di Hub Search. La prima richiesta GET a `/search` applica il filtro `dataset`, il filtro sul catalogo (default `dati-gov-it`), `scroll=true` e `limit=1000`. La risposta contiene il primo batch e uno `scrollId`; le richieste successive interrogano `/scroll?scrollId=...` fino a quando l'API restituisce una pagina vuota. Gli ID vengono deduplicati e inseriti nell'inventario SQLite senza azzerare gli stati dei dataset già presenti.
+
+`page_size` è impostato a 1000 (massimo richiesto dallo script di discovery). `discover --limit N` resta disponibile per i test e interrompe localmente l'estrazione dopo N ID; senza `--limit`, la discovery attraversa lo scroll fino al termine.
