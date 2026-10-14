@@ -1,39 +1,39 @@
 # MQA Cross-Version Analysis
 
-Analisi della conformità cross-version DCAT-AP dei metadati del catalogo `dati-gov-it` così come presenti nel piveau Hub di data.europa.eu.
+Analisi sperimentale della conformità dei metadati DCAT-AP dei dataset del catalogo `dati-gov-it` presenti nel piveau Hub di data.europa.eu.
 
-La pipeline separa volutamente **sorgente dei metadata** e **validator SHACL**:
-
-```text
-data.europa.eu / piveau Hub
-          |
-          v
-    discovery dataset
-          |
-          v
-       fetch RDF
-          |
-          v
-  validating-shacl LOCALE
-          |
-          v
-      SQLite + reports
-```
-
-Per default il progetto usa il validator locale:
+La pipeline è composta da **tre operazioni indipendenti**, eseguite tramite tre comandi CLI distinti:
 
 ```text
-http://192.168.122.221:8080/shacl/validation/report
+                 data.europa.eu / piveau Hub
+                         |
+              +----------+----------+
+              |                     |
+         Hub Search             Hub Repo
+              |                     |
+              v                     v
+          discover                fetch
+              |                     |
+              v                     v
+        SQLite inventory       data/rdf/*.ttl
+                                    |
+                                    v
+                                  run
+                                    |
+                                    v
+                         SHACL validator LOCALE
+                                    |
+                                    v
+                              analysis.db
 ```
 
-Il servizio pubblico di data.europa.eu non viene usato per la validazione, ma il piveau Hub europeo continua a essere usato per recuperare i
-metadata del catalogo `dati-gov-it`.
+Il servizio pubblico di data.europa.eu non viene usato per la validazione. La validazione viene eseguita esclusivamente tramite l'istanza locale di `validating-shacl`.
 
 ## Requisiti
 
 - Python 3.11+
-- accesso Internet verso `data.europa.eu` per discovery/fetch dei metadata
-- un'istanza locale di `validating-shacl` raggiungibile sulla porta 8080
+- accesso Internet verso `data.europa.eu` per discovery e fetch
+- un'istanza locale di `validating-shacl` raggiungibile sulla porta configurata
 
 ## Installazione
 
@@ -43,143 +43,303 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Test minimo consigliato
+## Comandi
 
-Prima verificare direttamente il validator locale con un TTL già disponibile:
+### 1. `discover` — recupero degli ID
 
-```bash
-curl -sS \
-  -o /tmp/report.ttl \
-  -w 'HTTP %{http_code}\n' \
-  -X POST \
-  'http://192.168.122.221:8080/shacl/validation/report?shapeModel=dcatap300level1' \
-  -H 'Content-Type: text/turtle' \
-  -H 'Accept: text/turtle' \
-  --data-binary '@/home/riccardo/bologna.ttl'
+Recupera gli ID dei dataset tramite l'endpoint dedicato di Hub Search:
+
+```text
+GET /api/hub/search/datasets?catalogue=dati-gov-it
 ```
 
-Se il validator risponde correttamente, il test del progetto può essere eseguito con un solo dataset:
-
-```bash
-python -m mqa_cv run --limit 1
-```
-
-`--limit 1` ora limita **l'intera pipeline**: discovery, fetch e validation. Non verranno quindi processati eventuali dataset rimasti nel
-database da esecuzioni precedenti.
-
-## Profili locali
-
-Quando possibile il progetto usa l'`openapi-shacl.yaml` della stessa installazione locale di `validating-shacl`, così la lista degli
-`shapeModel` è coerente con la versione realmente in esecuzione.
-
-È possibile indicare esplicitamente il file:
-
-```bash
-python -m mqa_cv validate \
-  --openapi /opt/mqa/validating-shacl/src/main/resources/webroot/openapi-shacl.yaml
-```
-
-Oppure tramite variabile d'ambiente:
-
-```bash
-export MQA_SHACL_OPENAPI=/opt/mqa/validating-shacl/src/main/resources/webroot/openapi-shacl.yaml
-```
-
-Se `--openapi` non viene specificato, vengono cercati automaticamente alcuni percorsi standard. Se nessuno esiste, viene usata una lista
-incorporata di fallback. Il programma stampa sempre quale sorgente dei profili sta utilizzando.
-
-## Pipeline incrementale
-
-Il database mantiene un inventario persistente degli ID. `discover` aggiorna l'inventario senza scaricare RDF; `run` aggiorna automaticamente l'inventario e poi lavora sui dataset ancora da acquisire/validare. Gli ID sono ordinati localmente in modo deterministico per `dataset_id` crescente. Gli ID già presenti non vengono duplicati e i loro stati non vengono azzerati.
-
-### Aggiornare soltanto l'inventario
+L'endpoint restituisce direttamente la lista completa degli ID del catalogo. `discover` effettua quindi una sola richiesta HTTP e non scarica i metadata RDF.
 
 ```bash
 python -m mqa_cv discover
 ```
 
-Per un test limitato: `python -m mqa_cv discover --limit 10`. Il limite limita gli ID aggiunti dalla scansione, non effettua fetch o validazioni.
-
-### Run incrementale completa
+Per un test limitato:
 
 ```bash
-python -m mqa_cv run --limit 100
+python -m mqa_cv discover --limit 10
 ```
 
-La `run` esegue in sequenza: (1) discovery/aggiornamento inventario, (2) fetch fino a 100 dataset in coda, (3) validazione fino a 100 dataset con RDF acquisito e validazione in attesa, (4) rigenerazione report. Il limite si applica separatamente alle fasi di fetch e validazione.
+Attenzione: `--limit` è applicato **dopo** il recupero dell'intera lista dall'API. Non riduce il tempo della richiesta HTTP.
 
-Per usare soltanto l'inventario già presente senza interrogare Hub Search: `python -m mqa_cv run --no-discover --limit 100`.
+### 2. `fetch` — scaricamento RDF
 
-### Comandi disponibili
+Scarica esclusivamente i dataset presenti nell'inventario locale che non sono ancora stati acquisiti oppure hanno avuto un errore di fetch precedente.
 
 ```bash
-python -m mqa_cv discover [--limit N] [--catalogue ID]
-python -m mqa_cv run [--limit N] [--catalogue ID] [--no-discover]
+python -m mqa_cv fetch --limit 10
 ```
 
-Gli errori di fetch e validazione rimangono registrati con stati distinti e possono essere ritentati nelle run successive. Un dataset è marcato `completed` soltanto quando tutti i profili configurati hanno restituito un esito interpretabile con HTTP 200.
+Senza `--limit` vengono elaborati tutti i dataset attualmente in coda:
 
-## Timeout e retry
+```bash
+python -m mqa_cv fetch
+```
 
-Per il validator locale i valori predefiniti sono volutamente conservativi:
+`fetch` non esegue discovery e non esegue validazioni.
+
+I file RDF vengono salvati in:
 
 ```text
-timeout       = 30 s
-request_delay = 0 s
-retries       = 0
+data/rdf/
 ```
 
-Questo evita che un validator locale non raggiungibile rimanga apparentemente bloccato per diversi minuti a causa di retry e backoff.
+### 3. `run` — validazione SHACL
 
-I valori possono essere modificati dalla CLI, per esempio:
+Valida esclusivamente i dataset RDF già scaricati tramite il validator SHACL locale.
 
 ```bash
-python -m mqa_cv validate --timeout 60 --retries 1
+python -m mqa_cv run --limit 10
 ```
 
-## Errori del validator
+Senza `--limit` vengono elaborati tutti i dataset con RDF disponibile e una matrice di validazione ancora incompleta:
 
-Un errore HTTP o di rete non viene interpretato come non-compliance:
+```bash
+python -m mqa_cv run
+```
+
+`run` non esegue discovery e non scarica dataset.
+
+## Profili SHACL: OpenAPI prima del fallback
+
+`run` **non utilizza più direttamente una lista fissa di profili**.
+
+All'avvio della fase di validazione il progetto cerca gli `enum` del parametro `shapeModel` nell'OpenAPI del validator. La priorità è:
+
+1. file indicato da `MQA_SHACL_OPENAPI`;
+2. file `openapi-shacl.yaml` / `openapi-shacl.yml` nel progetto o nei percorsi standard del checkout locale del validator;
+3. URL indicato da `MQA_SHACL_OPENAPI_URL`;
+4. OpenAPI esposto dallo stesso validator (`/openapi-shacl.yaml` o `/openapi-shacl.yml`, con alcuni percorsi alternativi);
+5. solo se tutti i precedenti tentativi falliscono, lista `BUILTIN_PROFILES` incorporata.
+
+Se un file OpenAPI **esplicitamente configurato** esiste ma è sintatticamente errato o non contiene alcun `shapeModel` valido, il programma termina con errore invece di sostituirlo silenziosamente con il fallback.
+
+Il parametro `customized` non viene considerato un profilo della matrice sperimentale perché richiede una configurazione aggiuntiva dei suoi aspetti.
+
+I profili il cui identificativo contiene `de` (ricerca case-insensitive) vengono esclusi dalla matrice: non saranno validati né attesi come parte del completamento del dataset. Eventuali righe storiche già presenti nel database rimangono conservate come traccia delle esecuzioni precedenti.
+
+È possibile vedere nei log la sorgente usata, ad esempio:
 
 ```text
-HTTP 200 + sh:conforms=true   -> COMPLIANT
-HTTP 200 + sh:conforms=false  -> NON_COMPLIANT
-HTTP 4xx/5xx                  -> VALIDATOR_ERROR
-errore di rete                -> VALIDATOR_ERROR
-report RDF non interpretabile -> VALIDATOR_ERROR
+Profile source: file:/.../openapi-shacl.yaml (24 profiles)
 ```
 
-La fonte autorevole della conformità è `sh:conforms`; il numero di `sh:Violation` viene registrato separatamente.
+oppure:
+
+```text
+Profile source: url:http://localhost:8080/openapi-shacl.yaml (24 profiles)
+```
+
+Solo in caso di assenza dell'OpenAPI:
+
+```text
+Profile source: builtin [BUILT-IN FALLBACK]
+```
+
+## Validazione intelligente per livelli
+
+Per ogni catena DCAT-AP con Level 1/2/3, `run` ordina le validazioni nel seguente modo:
+
+```text
+dcatap301level1 -> dcatap301level2 -> dcatap301level3 -> dcatap301
+```
+
+Il principio è quello della metodologia MQA:
+
+- Level 1 = Base;
+- Level 2 = Base + vocabolari;
+- Level 3 = Base + vocabolari + proprietà raccomandate;
+- nessun livello = Base + vocabolari + proprietà raccomandate + ranges.
+
+Perciò, se ad esempio:
+
+```text
+dcatap301level1 -> conforms=false
+```
+
+non vengono eseguite:
+
+```text
+dcatap301level2
+dcatap301level3
+dcatap301
+```
+
+Nel database vengono comunque registrate come `skipped`, con la motivazione e il profilo che ha bloccato la catena.
+
+Se invece Level 1 restituisce un errore tecnico (HTTP diverso da 200, timeout, report RDF non interpretabile, ecc.), il profilo viene registrato come `error` e **non** viene considerato equivalente a `conforms=false`. La catena resta quindi incompleta e sarà ritentata in una successiva esecuzione.
+
+Le versioni senza Level 1/2/3, come i profili storici `orig` o `conventions`, vengono trattate come catene indipendenti e non vengono collegate artificialmente alle altre.
 
 ## Database
 
-`analysis.db` distingue i risultati mediante:
+`analysis.db` costituisce il punto centrale della pipeline.
+
+La tabella `datasets` contiene l'inventario e lo stato delle acquisizioni/validazioni.
+
+La tabella `validations` contiene il risultato o lo stato di esecuzione per ogni combinazione:
 
 ```text
-(dataset_id, shape_model, validator_url)
+(dataset_id, validator_url, shape_model)
 ```
 
-È quindi possibile conservare nello stesso database risultati ottenuti da validator differenti senza confonderli.
+Oltre ai dati aggregati del report SHACL, la v0.4.3 conserva il corpo originale e indicizza ogni risultato individuale.
 
-## Output
+- `validations`: esito aggregato per dataset e profilo, contatori, stato HTTP, errore, checksum SHA-256, dimensione originale/compattata, Content-Type, formato e metadati del nodo `sh:ValidationReport`. Il corpo originale della risposta è conservato nella colonna `report_body_gzip` come BLOB compresso con gzip.
+- `validation_results`: una riga per ciascun nodo `sh:ValidationResult`, con focus node, property path, value, source shape, constraint component, severity e messaggi. Il campo `properties_json` conserva **tutte le proprietà RDF direttamente associate al risultato**, comprese quelle non previste dalle colonne principali, con datatype e language tag dei literal.
 
-- `analysis.db`: SQLite con dataset, validazioni e provenienza del validator
-- `data/rdf/*.ttl`: grafi RDF recuperati dal piveau Hub
-- `reports/datasets/*.md`: report per dataset
-- `reports/summary.csv`: aggregazione per validator e profilo
-- `reports/summary.md`: report generale
+Ho scelto un BLOB compresso in `analysis.db` invece di un file per ogni coppia dataset/profilo: con decine di migliaia di dataset, la soluzione a file separati rischierebbe di creare centinaia di migliaia di piccoli file. Il report completo e i dettagli indicizzati vengono salvati nella stessa transazione SQLite, mentre gzip limita lo spazio richiesto. Per corpi HTTP d'errore viene salvata la risposta originale, utile alla diagnosi; gli errori di rete senza risposta non hanno un corpo da conservare. Il checksum SHA-256 si riferisce al corpo originale non compresso.
+
+La conformità viene determinata dal valore `sh:conforms` restituito dal report SHACL. Un errore HTTP, un errore di rete o un report non interpretabile non vengono classificati come non-conformità. I livelli più alti saltati a causa di un livello precedente non conforme non hanno un report prodotto dal validator: sono registrati in `validations` con `execution_status='skipped'`.
+
+### Consultare i risultati individuali
+
+Il comando `reports` stampa i risultati indicizzati in JSON su stdout, senza creare file `.csv` o `.md`:
+
+```bash
+# Risultati di un dataset e di uno specifico profilo
+python -m mqa_cv reports --dataset-id ID_DATASET --profile dcatap301level1
+
+# Solo violazioni di un profilo
+python -m mqa_cv reports --profile dcatap301level1 --severity Violation --limit 200
+
+# Stampa il report RDF originale decompresso su stdout
+python -m mqa_cv reports --dataset-id ID_DATASET --profile dcatap301level1 --raw-report
+```
+
+L'opzione `--raw-report` richiede entrambi i filtri `--dataset-id` e `--profile`; il corpo viene scritto su stdout, quindi può essere reindirizzato se serve conservarlo come file, per esempio aggiungendo `> report.ttl` al comando. Il Content-Type originale si trova in `validations.report_content_type`.
+
+Le colonne comuni sono direttamente interrogabili in SQLite. Esempio: frequenza delle componenti SHACL che generano violazioni per profilo:
+
+```sql
+SELECT v.shape_model, r.source_constraint_component, COUNT(*) AS occurrences
+FROM validation_results AS r
+JOIN validations AS v ON v.id = r.validation_id
+WHERE r.severity = 'Violation'
+  AND v.execution_status = 'validated'
+GROUP BY v.shape_model, r.source_constraint_component
+ORDER BY v.shape_model, occurrences DESC;
+```
+
+Per confrontare gli stessi problemi tra dataset:
+
+```sql
+SELECT v.shape_model, r.result_path, r.source_constraint_component,
+       r.severity, COUNT(DISTINCT v.dataset_id) AS datasets, COUNT(*) AS occurrences
+FROM validation_results AS r
+JOIN validations AS v ON v.id = r.validation_id
+GROUP BY v.shape_model, r.result_path, r.source_constraint_component, r.severity
+ORDER BY datasets DESC, occurrences DESC;
+```
+
+I report delle versioni precedenti non erano stati salvati. Quando la v0.4.3 aggiorna un database precedente, i dataset con validazioni riuscite ma senza report vengono rimessi in coda `pending`, così `run` può acquisire il corpo originale e i dettagli individuali. I file RDF già scaricati non vengono riscaricati. Nel database incluso nell’archivio la migrazione è già stata applicata: restano presenti 61.721 dataset e 22 validazioni aggregate precedenti; queste ultime non contengono ancora i nuovi report, per cui il dataset corrispondente è già in coda per una nuova validazione.
+
+## Stati
+
+### Fetch
+
+```text
+pending     -> dataset da scaricare
+ok          -> RDF scaricato correttamente
+fetch_error -> errore durante lo scaricamento
+```
+
+### Validation
+
+```text
+pending          -> RDF disponibile ma mai validato
+validating       -> validazione in corso
+completed        -> tutte le catene/profili attesi sono terminali
+validation_error -> una o più operazioni di validazione devono essere ritentate
+```
+
+### Stato dei singoli profili
+
+```text
+validated -> il validator ha prodotto un report interpretabile
+skipped   -> il profilo non è stato eseguito perché il precedente livello della stessa catena era non conforme
+error     -> impossibile ottenere un esito di conformità
+```
+
+## Validator locale
+
+Per default:
+
+```text
+http://localhost:8080/shacl/validation/report
+```
+
+È possibile sovrascrivere il percorso OpenAPI senza modificare il codice:
+
+```bash
+export MQA_SHACL_OPENAPI=/percorso/assoluto/openapi-shacl.yaml
+```
+
+oppure l'URL dell'OpenAPI:
+
+```bash
+export MQA_SHACL_OPENAPI_URL=http://localhost:8080/openapi-shacl.yaml
+```
+
+### Verifica manuale di un profilo
+
+Per isolare completamente eventuali problemi del progetto dal validator, la stessa richiesta costruita dal client può essere eseguita direttamente con `curl`:
+
+```bash
+curl -sS \\
+  -o /tmp/report.ttl \\
+  -w 'HTTP=%{http_code} TIME=%{time_total}s\\n' \\
+  -X POST \\
+  'http://localhost:8080/shacl/validation/report?shapeModel=dcatap200' \\
+  -H 'Content-Type: text/turtle' \\
+  -H 'Accept: text/turtle' \\
+  --data-binary '@/percorso/dataset.ttl'
+```
+
+Il progetto invia lo stesso metodo `POST`, lo stesso parametro `shapeModel` e lo stesso `Content-Type`. Se il validator restituisce:
+
+```text
+HTTP 400: Could not initialize class io.piveau.validating.DCATAP200
+```
+
+il riferimento alla classe Kotlin/Java `io.piveau.validating.DCATAP200` indica un errore durante l'inizializzazione interna del validator, non un errore generato dal client Python. In questo caso il test con `curl` costituisce la verifica decisiva.
+
+L'OpenAPI pubblica corrente del servizio elenca comunque `dcatap200` tra i valori ammessi di `shapeModel`, mentre il progetto `validating-shacl` documenta che le shape devono essere associate nel codice del servizio e registrate anche nell'OpenAPI. Questo rende particolarmente plausibile una discrepanza interna all'istanza del validator se `dcatap200` è esposto dall'OpenAPI ma fallisce a runtime. La versione effettivamente installata sulla macchina locale resta quella da verificare. 
+
+## Esecuzione tipica
+
+Le tre fasi sono completamente separate:
+
+```bash
+python -m mqa_cv discover
+python -m mqa_cv fetch --limit 100
+python -m mqa_cv run --limit 100
+```
+
+È quindi possibile interrompere una fase e riprenderla successivamente senza ripetere le altre.
+
+La selezione di `fetch` e `run` è deterministica e utilizza la `position` memorizzata nell'inventario, con `dataset_id` come criterio secondario.
+
+## Output del progetto
+
+Il progetto non genera report `.csv` o `.md`.
+
+Gli output persistenti sono:
+
+- `analysis.db` — inventario e risultati/stati delle validazioni;
+- `data/rdf/*.ttl` — copie locali dei metadata RDF recuperati dal piveau Hub.
+
+Il database è quindi la fonte strutturata dei risultati dell'esperimento.
 
 ## Nota metodologica
 
-Il progetto non scarica direttamente i metadata da `dati.gov.it`. I metadata sono quelli del catalogo `dati-gov-it` presenti nel piveau Hub
-di data.europa.eu.
+La metodologia MQA distingue esplicitamente quattro configurazioni SHACL: Level 1 (Base), Level 2 (Base + vocabolari), Level 3 (Base + vocabolari + proprietà raccomandate) e All shapes (con anche i ranges). Questa struttura è alla base dello short-circuit implementato nel progetto. 
 
-Questa scelta permette di mantenere costante la sorgente RDF mentre si cambia soltanto il validator/shape model. Un eventuale confronto con
-il CKAN originale di `dati.gov.it` costituisce un esperimento separato.
+Il progetto non scarica direttamente i metadata da `dati.gov.it`. I metadata sono quelli del catalogo `dati-gov-it` presenti nel piveau Hub di data.europa.eu.
 
-
-### Recupero completo degli ID tramite Scroll API
-
-La discovery usa la modalità scroll di Hub Search. La prima richiesta GET a `/search` applica il filtro `dataset`, il filtro sul catalogo (default `dati-gov-it`), `scroll=true` e `limit=1000`. La risposta contiene il primo batch e uno `scrollId`; le richieste successive interrogano `/scroll?scrollId=...` fino a quando l'API restituisce una pagina vuota. Gli ID vengono deduplicati e inseriti nell'inventario SQLite senza azzerare gli stati dei dataset già presenti.
-
-`page_size` è impostato a 1000 (massimo richiesto dallo script di discovery). `discover --limit N` resta disponibile per i test e interrompe localmente l'estrazione dopo N ID; senza `--limit`, la discovery attraversa lo scroll fino al termine.
+La discovery utilizza l'operazione catalog-specifica di Hub Search per ottenere l'insieme degli ID. La fase `fetch` recupera successivamente il RDF di ciascun dataset dall'Hub Repo, mentre `run` sottopone lo stesso RDF al validator SHACL locale per i `shapeModel` effettivamente dichiarati dal suo OpenAPI.

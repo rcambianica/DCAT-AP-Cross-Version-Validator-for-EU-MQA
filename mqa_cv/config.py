@@ -13,14 +13,15 @@ class Config:
     # The European portal currently exposes this Italian catalogue in Hub Search.
     catalogue_id: str = "dati-gov-it"
 
-    # Network and pagination parameters.
-    page_size: int = 1000
+    # Network parameters.
     timeout: int = 60
 
     # Filesystem paths.
     rdf_dir: Path = Path("data/rdf")
-    reports_dir: Path = Path("reports")
     db_path: Path = Path("analysis.db")
 
     # Local SHACL validator.
-    validator_url: str = "http://192.168.122.221:8080/shacl/validation/report"
+    validator_url: str = "http://localhost:8080/shacl/validation/report"
+    validator_timeout: int = 30
+    validator_openapi_path: Path | None = None
+    validator_openapi_url: str | None = None

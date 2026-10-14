@@ -1,5 +1,4 @@
 import logging
-from typing import Iterator
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
@@ -37,131 +36,55 @@ class HubClient:
         session.mount("https://", adapter)
         session.mount("http://", adapter)
         session.headers.update({
-            "User-Agent": "MQA-Cross-Version-Validator/1.0",
+            "User-Agent": "MQA-Cross-Version-Validator/0.4.2",
             "Accept": "application/json",
         })
         return session
 
-    def list_catalogues(self) -> list[str]:
-        """Return catalogue identifiers exposed by Hub Search."""
-        url = f"{self.search_base_url}/catalogues"
-        response = self.session.get(url, timeout=self.timeout)
-        response.raise_for_status()
-        data = response.json()
-        if not isinstance(data, list):
-            raise RuntimeError(f"Unexpected /catalogues response: {type(data).__name__}")
-        return [str(x) for x in data]
+    def get_dataset_ids(self, catalogue_id: str) -> list[str]:
+        """Return all dataset IDs belonging to a catalogue.
 
-    def iter_dataset_ids(
-        self,
-        catalogue_id: str | None = None,
-        page_size: int = 1000,
-        limit: int | None = None,
-    ) -> Iterator[str]:
-        """Iterate dataset IDs using Hub Search's scroll API.
-
-        The initial /search request creates a scroll context and returns the
-        first batch plus a scrollId. Subsequent batches are fetched from
-        /scroll until the API returns an empty page or no scrollId remains.
-        ``limit`` is a local cap intended for test runs; by default all IDs
-        exposed by the scroll context are yielded.
+        Hub Search exposes a catalogue-specific endpoint that returns the IDs
+        directly. Unlike the generic /search + /scroll workflow, this requires
+        one HTTP request and avoids downloading indexed dataset metadata that
+        discovery does not need.
         """
-        import json
-        import time
+        if not catalogue_id:
+            raise ValueError("catalogue_id is required")
 
-        if page_size < 1 or page_size > 1000:
-            raise ValueError("page_size must be between 1 and 1000")
-
-        if catalogue_id:
-            logger.info("Checking catalogue '%s' in Hub Search...", catalogue_id)
-            catalogues = self.list_catalogues()
-            if catalogue_id not in catalogues:
-                raise ValueError(
-                    f"Catalogue '{catalogue_id}' is not exposed by Hub Search. "
-                    f"Available catalogue IDs include: {', '.join(catalogues[:20])}"
-                    + (" ..." if len(catalogues) > 20 else "")
-                )
-
-        search_url = f"{self.search_base_url}/search"
-        params = {
-            "filters": "dataset",
-            "facets": json.dumps({"catalog": [catalogue_id]}, separators=(",", ":")) if catalogue_id else None,
-            "scroll": "true",
-            "limit": page_size,
-        }
-        # Requests omits query parameters whose value is None.
-        logger.info(
-            "Search API: starting scroll (catalogue=%s, page_size=%d)",
-            catalogue_id or "<all>", page_size,
-        )
+        url = f"{self.search_base_url}/datasets"
+        logger.info("Hub Search: retrieving dataset IDs for catalogue=%s", catalogue_id)
         response = self.session.get(
-            search_url, params=params, timeout=self.timeout
+            url,
+            params={"catalogue": catalogue_id},
+            timeout=self.timeout,
         )
         response.raise_for_status()
         data = response.json()
-        result = data.get("result") or {}
-        scroll_id = result.get("scrollId") or data.get("scrollId")
-        results = result.get("results") or []
 
+        if not isinstance(data, list):
+            raise RuntimeError(
+                "Unexpected /datasets response: "
+                f"expected JSON list, got {type(data).__name__}"
+            )
+
+        ids: list[str] = []
         seen: set[str] = set()
-        emitted = 0
-        page = 1
+        for value in data:
+            if value is None:
+                continue
+            dataset_id = str(value).strip()
+            if not dataset_id or dataset_id in seen:
+                continue
+            seen.add(dataset_id)
+            ids.append(dataset_id)
 
-        while True:
-            logger.info(
-                "Search API scroll: page=%d returned=%d%s",
-                page, len(results), f" total_distinct={emitted}" if emitted else "",
-            )
-            if not results:
-                logger.info("Search API scroll: no more results.")
-                break
-
-            new_ids = 0
-            for item in results:
-                if not isinstance(item, dict):
-                    continue
-                value = item.get("id") or item.get("idName")
-                if not value:
-                    continue
-                dataset_id = str(value)
-                if dataset_id in seen:
-                    continue
-                seen.add(dataset_id)
-                emitted += 1
-                new_ids += 1
-                yield dataset_id
-                if limit is not None and emitted >= limit:
-                    logger.info("Search API scroll: reached local limit=%d", limit)
-                    return
-
-            if not scroll_id:
-                logger.warning(
-                    "Search API returned %d result(s) without a scrollId; "
-                    "the scroll cannot continue. Distinct IDs collected: %d.",
-                    len(results), emitted,
-                )
-                break
-
-            # A short pause reduces pressure on the search service.
-            time.sleep(0.1)
-            scroll_url = f"{self.search_base_url}/scroll"
-            scroll_response = self.session.get(
-                scroll_url,
-                params={"scrollId": scroll_id},
-                timeout=self.timeout,
-            )
-            scroll_response.raise_for_status()
-            scroll_data = scroll_response.json()
-            scroll_result = scroll_data.get("result") or {}
-            scroll_id = (
-                scroll_result.get("scrollId")
-                or scroll_data.get("scrollId")
-                or scroll_id
-            )
-            results = scroll_result.get("results") or []
-            page += 1
-
-        logger.info("Search API scroll completed: distinct_ids=%d pages=%d", emitted, page)
+        logger.info(
+            "Hub Search: catalogue=%s returned %d distinct dataset IDs",
+            catalogue_id,
+            len(ids),
+        )
+        return ids
 
     def fetch_dataset_rdf(self, dataset_id: str) -> tuple[str, str]:
         """Retrieve a dataset's RDF graph through the Repo API.
