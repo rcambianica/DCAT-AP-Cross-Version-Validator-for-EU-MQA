@@ -51,20 +51,31 @@ def test_get_categories_uses_facet_and_italian_labels():
     assert '"catalog":["dati-gov-it"]' in call["params"]["facets"]
 
 
-def test_get_dataset_ids_by_category_paginates_and_deduplicates():
+def test_get_dataset_ids_by_categories_uses_scroll_and_deduplicates():
     client = HubClient()
     client.session = FakeSession([
-        FakeResponse({"result": {"results": [{"id": "dataset-1"}, {"id": "dataset-2"}]}}),
-        FakeResponse({"result": {"results": [{"id": "dataset-2"}, {"id": "dataset-3"}]}}),
+        FakeResponse({"result": {"results": [
+            {"id": "dataset-1"}, {"id": "dataset-2"},
+        ]}, "scrollId": "scroll-1"}),
+        FakeResponse({"result": {"results": [
+            {"id": "dataset-2"}, {"id": "dataset-3"},
+        ]}, "scrollId": "scroll-2"}),
         FakeResponse({"result": {"results": []}}),
     ])
 
-    ids = client.get_dataset_ids_by_category("dati-gov-it", "ENVI", page_size=2)
+    ids = client.get_dataset_ids_by_categories(
+        "dati-gov-it", ["ENVI", "ECON"], category_count=10
+    )
 
     assert ids == ["dataset-1", "dataset-2", "dataset-3"]
-    assert [call["params"]["page"] for call in client.session.calls] == [0, 1, 2]
-    assert all(call["params"]["filters"] == "dataset" for call in client.session.calls)
-    assert all('"categories":["ENVI"]' in call["params"]["facets"] for call in client.session.calls)
+    assert len(client.session.calls) == 3
+    params = client.session.calls[0]["params"]
+    assert params["page"] == 0
+    assert params["limit"] == 1000
+    assert params["scroll"] == "true"
+    assert '"categories":["ENVI","ECON"]' in params["facets"]
+    assert client.session.calls[1]["url"].endswith("/scroll")
+    assert client.session.calls[1]["params"] == {"scrollId": "scroll-1"}
 
 
 def test_get_dataset_ids_by_category_respects_limit():

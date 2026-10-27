@@ -6,6 +6,7 @@ import logging
 import os
 import sys
 import time
+from urllib.parse import quote
 
 from src.config import Config
 from src.db import Database
@@ -51,46 +52,65 @@ def list_categories(catalogue_id: str | None = None) -> None:
 
 def discover_datasets(
     catalogue_id: str | None = None,
-    category_id: str | None = None,
+    category_id: str | list[str] | None = None,
     limit: int | None = None,
 ) -> None:
-    """Discover dataset IDs, optionally restricted to one Hub Search category."""
+    """Discover dataset IDs in one request, optionally restricted to categories."""
     cfg = Config()
     if catalogue_id:
         cfg.catalogue_id = catalogue_id
 
     hub, db = _clients(cfg)
-    if category_id:
+    requested_categories = []
+    if isinstance(category_id, str):
+        requested_categories = [part.strip() for part in category_id.split(",") if part.strip()]
+    elif category_id:
+        requested_categories = [part.strip() for value in category_id for part in value.split(",") if part.strip()]
+
+    selected_categories = []
+    if requested_categories:
         available = hub.get_categories(cfg.catalogue_id)
-        category = next(
-            (item for item in available if item["id"].casefold() == category_id.casefold()
-             or item["label"].casefold() == category_id.casefold()),
-            None,
-        )
-        if category is None:
-            choices = ", ".join(f"{item['id']} ({item['label']})" for item in available)
-            raise SystemExit(f"Categoria non riconosciuta: {category_id}. Disponibili: {choices}")
-        selected_id = category["id"]
+        for requested in requested_categories:
+            category = next(
+                (item for item in available
+                 if item["id"].casefold() == requested.casefold()
+                 or item["label"].casefold() == requested.casefold()),
+                None,
+            )
+            if category is None:
+                choices = ", ".join(f"{item['id']} ({item['label']})" for item in available)
+                raise SystemExit(f"Categoria non riconosciuta: {requested}. Disponibili: {choices}")
+            if category["id"] not in [item["id"] for item in selected_categories]:
+                selected_categories.append(category)
+
+        selected_ids = [item["id"] for item in selected_categories]
+        category_count = sum(item["count"] for item in selected_categories)
         logger.info(
-            "Discovering dataset IDs: catalogue=%s category=%s (%s)",
-            cfg.catalogue_id, selected_id, category["label"],
+            "Discovering dataset IDs in one request: catalogue=%s categories=%s",
+            cfg.catalogue_id,
+            ", ".join(f"{item['id']} ({item['label']})" for item in selected_categories),
         )
-        all_ids = hub.get_dataset_ids_by_category(
-            cfg.catalogue_id, selected_id, limit=limit
+        ids = hub.get_dataset_ids_by_categories(
+            cfg.catalogue_id,
+            selected_ids,
+            limit=limit,
+            category_count=category_count,
         )
-        ids = all_ids
+        selected_category_id = ",".join(selected_ids)
+        category_label = ",".join(selected_ids)
     else:
-        logger.info("Discovering dataset IDs: catalogue=%s category=all", cfg.catalogue_id)
+        logger.info("Discovering dataset IDs in one request: catalogue=%s category=all", cfg.catalogue_id)
         all_ids = hub.get_dataset_ids(cfg.catalogue_id)
         ids = all_ids[:limit] if limit is not None else all_ids
+        selected_category_id = None
+        category_label = "all"
 
-    selected_category_id = selected_id if category_id else None
     inserted, total = db.add_discovered_datasets(
         ids, cfg.catalogue_id, category_id=selected_category_id
     )
     logger.info(
         "Discovery completed: category=%s received=%d new=%d inventory_total=%d",
-        category_id or "all", len(ids), inserted, total,
+        category_label, len(ids), inserted, total,
     )
 
 
@@ -130,7 +150,7 @@ def fetch_datasets(limit: int | None = None) -> int:
             db.update_fetch(
                 dataset_id,
                 status="fetch_error",
-                source_url=f"{cfg.repo_base_url}/datasets/{dataset_id}",
+                source_url=f"{cfg.repo_base_url}/resources/{quote(dataset_id, safe='-~')}",
                 rdf_path=str(rdf_path) if rdf_path.exists() else None,
                 http_status=getattr(getattr(exc, "response", None), "status_code", None),
                 error=str(exc),
@@ -365,15 +385,15 @@ def main() -> None:
     )
     discover_parser.add_argument(
         "--limit", type=int, default=None,
-        help="Numero massimo di dataset da inserire (con --category limita anche la paginazione API)",
+        help="Numero massimo di dataset da inserire",
     )
     discover_parser.add_argument(
         "--catalogue", default=None,
         help="Hub catalogue ID (default: dati-gov-it)",
     )
     discover_parser.add_argument(
-        "--category", default=None,
-        help="Categoria Hub Search (ID come ENVI oppure etichetta italiana come Ambiente)",
+        "--category", action="append", default=None,
+        help="Categoria Hub Search (ripetibile; ID come ENVI o etichetta come Ambiente; accetta anche valori separati da virgola)",
     )
 
     categories_parser = subparsers.add_parser(

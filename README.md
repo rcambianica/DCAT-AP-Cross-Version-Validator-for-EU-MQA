@@ -73,33 +73,36 @@ ECON     5981            Economia e finanze
 ...
 ```
 
-Esegui discovery sull'intero catalogo, mantenendo il comportamento precedente:
+Esegui discovery sull'intero catalogo: l'endpoint `/search/datasets` restituisce l'elenco degli ID in una singola richiesta.
 
 ```bash
 dcat-ap-cv discover
 ```
 
-Esegui discovery per una singola categoria, indicando l'ID oppure l'etichetta italiana:
+Esegui discovery per una categoria oppure per più categorie. Puoi indicare l'ID o l'etichetta restituita dall'API; le opzioni `--category` sono ripetibili e accettano anche una lista separata da virgole.
 
 ```bash
 dcat-ap-cv discover --category ENVI
 # equivalente, se l'etichetta è restituita dall'API:
 dcat-ap-cv discover --category Ambiente
+
+# più categorie
+dcat-ap-cv discover --category ENVI --category ECON
+# forma equivalente
+dcat-ap-cv discover --category ENVI,ECON
 ```
 
 Per limitare il numero di dataset in un test:
 
 ```bash
-python -m dcat-ap-cv discover --category ENVI --limit 20
+dcat-ap-cv discover --category ENVI --limit 20
 ```
 
-Con `--category`, MQA usa l'endpoint `/search/search` e la paginazione dell'API, filtrando contemporaneamente il catalogo e la categoria.
-Senza `--category`, mantiene l'endpoint `/search/datasets` che restituisce gli ID del catalogo. La selezione di una categoria restringe gli
-ID aggiunti dall'esecuzione corrente; non elimina dal database dataset scoperti in precedenza. L'inventario locale può quindi contenere
-dataset provenienti da più categorie o da discovery precedenti.
+Con una o più categorie, MQA invia una richiesta iniziale a `/search/search` con la facet `categories` e `scroll=true`, quindi recupera i batch successivi tramite `/scroll`. Non usa la paginazione ordinaria con `page` e non supera il limite API di 1000 risultati per risposta. I risultati delle categorie vengono uniti e deduplicati; `--limit`, se specificato, limita il totale raccolto.
 
-La facet può restituire conteggi aggiornati al momento della richiesta: non vanno trattati come una lista immutabile né come una misura
-stabile del catalogo nel tempo. Per la riproducibilità, registra data/ora, categoria selezionata e limite usato.
+Quando vengono selezionate più categorie, il campo `category_id` dell'inventario SQLite contiene gli identificativi selezionati separati da virgola. La discovery non elimina dal database dataset scoperti in precedenza. L'inventario locale può quindi contenere dataset provenienti da più categorie o da discovery precedenti.
+
+La facet può restituire conteggi aggiornati al momento della richiesta: non vanno trattati come una lista immutabile né come una misura stabile del catalogo nel tempo. Per la riproducibilità, registra data/ora, categorie selezionate e limite usato.
 
 ### 2. `fetch` — scaricamento RDF
 
@@ -117,6 +120,8 @@ python -m dcat-ap-cv fetch
 ```
 
 `fetch` non esegue discovery e non esegue validazioni.
+
+Il recupero RDF usa l’endpoint corrente del Repo API `GET /api/hub/repo/resources/{resourceId}`. La richiesta resta separata per ciascun dataset, così gli errori e i tentativi di recupero sono isolati.
 
 I file RDF vengono salvati in:
 

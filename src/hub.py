@@ -1,6 +1,7 @@
 import json
 import logging
 from typing import Any
+from urllib.parse import quote
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -147,6 +148,100 @@ class HubClient:
             ids.append(dataset_id)
         return ids
 
+    def get_dataset_ids_by_categories(
+        self,
+        catalogue_id: str,
+        category_ids: list[str],
+        limit: int | None = None,
+        category_count: int | None = None,
+    ) -> list[str]:
+        """Retrieve IDs for selected categories using Hub Search scroll.
+
+        Hub Search limits each search response to 1000 results. The scroll API
+        keeps one search context and allows retrieving the full result set without
+        incrementing ordinary page numbers.
+        """
+        if not catalogue_id:
+            raise ValueError("catalogue_id is required")
+        category_ids = list(dict.fromkeys(x.strip() for x in category_ids if x and x.strip()))
+        if not category_ids:
+            raise ValueError("at least one category_id is required")
+        if limit is not None and limit < 1:
+            raise ValueError("limit must be >= 1")
+
+        facets = dict(_CATALOGUE_FACETS)
+        facets["catalog"] = [catalogue_id]
+        facets["categories"] = category_ids
+        # The API caps a single response at 1000. The category count is only
+        # a useful estimate of the expected result size, not a valid API limit.
+        request_limit = min(1000, limit) if limit is not None else 1000
+        params = {
+            "filters": "dataset",
+            "limit": request_limit,
+            "page": 0,
+            "scroll": "true",
+            "includes": "id,categories.label,catalog.id",
+            "facets": json.dumps(facets, ensure_ascii=False, separators=(",", ":")),
+        }
+        logger.info(
+            "Hub Search: category discovery with scroll catalogue=%s categories=%s batch_limit=%d expected_count=%s",
+            catalogue_id, ",".join(category_ids), request_limit, category_count,
+        )
+        response = self.session.get(
+            f"{self.search_base_url}/search", params=params, timeout=self.timeout
+        )
+        response.raise_for_status()
+        payload = response.json()
+
+        def unpack(current_payload: dict[str, Any]) -> tuple[list[Any], str | None]:
+            result = current_payload.get("result", {})
+            results = result.get("results", [])
+            if not isinstance(results, list):
+                raise RuntimeError("Unexpected Hub Search response: result.results is not a list")
+            scroll_id = (
+                current_payload.get("scrollId")
+                or current_payload.get("scroll_id")
+                or result.get("scrollId")
+                or result.get("scroll_id")
+            )
+            return results, str(scroll_id) if scroll_id else None
+
+        results, scroll_id = unpack(payload)
+        ids = self._unique_ids(results)
+        if limit is None and len(results) >= request_limit and not scroll_id:
+            raise RuntimeError(
+                "Hub Search returned a full batch but no scrollId; discovery may be incomplete. "
+                "Check the API response or retry."
+            )
+
+        while scroll_id and (limit is None or len(ids) < limit):
+            scroll_response = self.session.get(
+                f"{self.search_base_url}/scroll",
+                params={"scrollId": scroll_id},
+                timeout=self.timeout,
+            )
+            scroll_response.raise_for_status()
+            scroll_payload = scroll_response.json()
+            next_results, next_scroll_id = unpack(scroll_payload)
+            if not next_results:
+                # An empty scroll batch marks successful exhaustion of the result set.
+                break
+            if limit is None and len(next_results) >= request_limit and not next_scroll_id:
+                raise RuntimeError(
+                    "Hub Search returned a full scroll batch but no next scrollId; "
+                    "discovery may be incomplete. Check the API response or retry."
+                )
+            ids = self._unique_ids(ids + next_results)
+            scroll_id = next_scroll_id
+
+        if limit is not None:
+            ids = ids[:limit]
+        logger.info(
+            "Hub Search: categories=%s catalogue=%s returned %d unique dataset IDs via scroll",
+            ",".join(category_ids), catalogue_id, len(ids),
+        )
+        return ids
+
     def get_dataset_ids_by_category(
         self,
         catalogue_id: str,
@@ -154,71 +249,20 @@ class HubClient:
         limit: int | None = None,
         page_size: int = 100,
     ) -> list[str]:
-        """Search dataset IDs in one category using Hub Search pagination.
+        """Backward-compatible wrapper for one-category discovery.
 
-        The category is a facet identifier such as ENVI, not its translated label.
-        ``limit`` caps returned IDs; ``None`` follows the API's reported result count.
+        ``page_size`` is accepted for compatibility but no longer used: discovery
+        intentionally performs a single Hub Search request.
         """
-        if not catalogue_id:
-            raise ValueError("catalogue_id is required")
-        if not category_id:
-            raise ValueError("category_id is required")
-        if page_size < 1:
-            raise ValueError("page_size must be >= 1")
-        if limit is not None and limit < 1:
-            raise ValueError("limit must be >= 1")
-
-        facets = dict(_CATALOGUE_FACETS)
-        facets["catalog"] = [catalogue_id]
-        facets["categories"] = [category_id]
-        ids: list[str] = []
-        seen: set[str] = set()
-        page = 0
-
-        while limit is None or len(ids) < limit:
-            request_limit = page_size if limit is None else min(page_size, limit - len(ids))
-            params = {
-                "filters": "dataset",
-                "limit": request_limit,
-                "page": page,
-                "includes": "id,categories.label,catalog.id",
-                "facets": json.dumps(facets, ensure_ascii=False, separators=(",", ":")),
-            }
-            response = self.session.get(
-                f"{self.search_base_url}/search", params=params, timeout=self.timeout
-            )
-            response.raise_for_status()
-            payload = response.json()
-            result = payload.get("result", {})
-            results = result.get("results", [])
-            if not isinstance(results, list):
-                raise RuntimeError("Unexpected Hub Search response: result.results is not a list")
-
-            page_ids = self._unique_ids(results)
-            for dataset_id in page_ids:
-                if dataset_id not in seen:
-                    seen.add(dataset_id)
-                    ids.append(dataset_id)
-                    if limit is not None and len(ids) >= limit:
-                        break
-
-            logger.info(
-                "Hub Search category=%s page=%d: received=%d distinct=%d",
-                category_id, page, len(results), len(page_ids),
-            )
-            if not results or len(results) < request_limit or not page_ids:
-                break
-            page += 1
-
-        logger.info(
-            "Hub Search: category=%s catalogue=%s returned %d dataset IDs",
-            category_id, catalogue_id, len(ids),
+        del page_size
+        return self.get_dataset_ids_by_categories(
+            catalogue_id, [category_id], limit=limit
         )
-        return ids
 
     def fetch_dataset_rdf(self, dataset_id: str) -> tuple[str, str]:
-        """Retrieve a dataset's RDF graph through the Repo API."""
-        url = f"{self.repo_base_url}/datasets/{dataset_id}"
+        """Retrieve a dataset's RDF graph through the current Repo resources API."""
+        resource_id = quote(dataset_id, safe="-~")
+        url = f"{self.repo_base_url}/resources/{resource_id}"
         headers = {
             "Accept": "text/turtle, application/ld+json, application/rdf+xml;q=0.9, text/n3;q=0.8"
         }
