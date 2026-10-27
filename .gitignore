@@ -6,4 +6,5 @@ data/rdf/*.ttl
 reports/*.csv
 reports/*.md
 data/
+build/
 *.egg-info

@@ -1,4 +1,4 @@
-from mqa_cv.hub import HubClient
+from src.hub import HubClient
 
 
 class FakeResponse:
@@ -80,7 +80,7 @@ def test_get_dataset_ids_by_category_respects_limit():
 
 
 def test_discovery_persists_category_id_and_preserves_it_on_unfiltered_discovery(tmp_path):
-    from mqa_cv.db import Database
+    from src.db import Database
 
     db = Database(tmp_path / "analysis.db")
     db.init_schema()
@@ -107,7 +107,7 @@ def test_discovery_persists_category_id_and_preserves_it_on_unfiltered_discovery
 
 def test_existing_database_migration_adds_category_id(tmp_path):
     import sqlite3
-    from mqa_cv.db import Database
+    from src.db import Database
 
     db_path = tmp_path / "legacy.db"
     with sqlite3.connect(db_path) as conn:

@@ -6,9 +6,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock
 
-from mqa_cv.db import Database
-from mqa_cv.profiles import _extract_shape_models
-from mqa_cv.validator import ShaclValidatorClient
+from src.db import Database
+from src.profiles import _extract_shape_models
+from src.validator import ShaclValidatorClient
 
 
 REPORT = b'''@prefix sh: <http://www.w3.org/ns/shacl#> .

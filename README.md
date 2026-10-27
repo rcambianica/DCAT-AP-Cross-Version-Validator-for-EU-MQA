@@ -1,6 +1,8 @@
-# MQA Cross-Version Analysis
+# DCAT-AP Cross-Version Validator for EU MQA
 
-Analisi sperimentale della conformità dei metadati DCAT-AP dei dataset del catalogo `dati-gov-it` presenti nel piveau Hub di data.europa.eu.
+Strumento Python per la validazione cross-version dei metadati DCAT-AP dei dataset del catalogo `dati-gov-it` presenti nel piveau Hub di
+data.europa.eu. Le validazioni vengono eseguite tramite il validatore SHACL locale di EU MQA (`validating-shacl`); questo progetto ne
+orchestra le richieste e raccoglie i risultati.
 
 La pipeline è composta da **tre operazioni indipendenti**, eseguite tramite tre comandi CLI distinti:
 
@@ -46,6 +48,8 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
+L’installazione crea il comando `dcat-ap-cv`. In alternativa, è possibile eseguire i comandi tramite `python -m dcat-ap-cv`.
+
 ## Comandi
 
 ### 1. `categories` e `discover` — categorie e inventario
@@ -57,7 +61,7 @@ passare all'API.
 Elenca le categorie disponibili:
 
 ```bash
-mqa_cv categories
+dcat-ap-cv categories
 ```
 
 Esempio di output:
@@ -72,21 +76,21 @@ ECON     5981            Economia e finanze
 Esegui discovery sull'intero catalogo, mantenendo il comportamento precedente:
 
 ```bash
-mqa_cv discover
+dcat-ap-cv discover
 ```
 
 Esegui discovery per una singola categoria, indicando l'ID oppure l'etichetta italiana:
 
 ```bash
-mqa_cv discover --category ENVI
+dcat-ap-cv discover --category ENVI
 # equivalente, se l'etichetta è restituita dall'API:
-mqa_cv discover --category Ambiente
+dcat-ap-cv discover --category Ambiente
 ```
 
 Per limitare il numero di dataset in un test:
 
 ```bash
-python -m mqa_cv discover --category ENVI --limit 20
+python -m dcat-ap-cv discover --category ENVI --limit 20
 ```
 
 Con `--category`, MQA usa l'endpoint `/search/search` e la paginazione dell'API, filtrando contemporaneamente il catalogo e la categoria.
@@ -103,13 +107,13 @@ Scarica esclusivamente i dataset presenti nell'inventario locale che non sono an
 precedente.
 
 ```bash
-python -m mqa_cv fetch --limit 10
+python -m dcat-ap-cv fetch --limit 10
 ```
 
 Senza `--limit` vengono elaborati tutti i dataset attualmente in coda:
 
 ```bash
-python -m mqa_cv fetch
+python -m dcat-ap-cv fetch
 ```
 
 `fetch` non esegue discovery e non esegue validazioni.
@@ -125,13 +129,13 @@ data/rdf/
 Valida esclusivamente i dataset RDF già scaricati tramite il validator SHACL locale.
 
 ```bash
-python -m mqa_cv run --limit 10
+python -m dcat-ap-cv run --limit 10
 ```
 
 Senza `--limit` vengono elaborati tutti i dataset con RDF disponibile e una matrice di validazione ancora incompleta:
 
 ```bash
-python -m mqa_cv run
+python -m dcat-ap-cv run
 ```
 
 `run` non esegue discovery e non scarica dataset.
@@ -277,13 +281,13 @@ Il comando `reports` stampa i risultati indicizzati in JSON su stdout, senza cre
 
 ```bash
 # Risultati di un dataset e di uno specifico profilo
-python -m mqa_cv reports --dataset-id ID_DATASET --profile dcatap301level1
+python -m dcat-ap-cv reports --dataset-id ID_DATASET --profile dcatap301level1
 
 # Solo violazioni di un profilo
-python -m mqa_cv reports --profile dcatap301level1 --severity Violation --limit 200
+python -m dcat-ap-cv reports --profile dcatap301level1 --severity Violation --limit 200
 
 # Stampa il report RDF originale decompresso su stdout
-python -m mqa_cv reports --dataset-id ID_DATASET --profile dcatap301level1 --raw-report
+python -m dcat-ap-cv reports --dataset-id ID_DATASET --profile dcatap301level1 --raw-report
 ```
 
 L'opzione `--raw-report` richiede entrambi i filtri `--dataset-id` e `--profile`; il corpo viene scritto su stdout, quindi può essere
@@ -401,9 +405,9 @@ versione effettivamente installata sulla macchina locale resta quella da verific
 Le tre fasi sono completamente separate:
 
 ```bash
-mqa_cv discover
-mqa_cv fetch --limit 100
-mqa_cv run --limit 100
+dcat-ap-cv discover
+dcat-ap-cv fetch --limit 100
+dcat-ap-cv run --limit 100
 ```
 
 È quindi possibile interrompere una fase e riprenderla successivamente senza ripetere le altre.

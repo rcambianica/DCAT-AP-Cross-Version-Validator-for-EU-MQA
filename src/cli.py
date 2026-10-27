@@ -7,16 +7,16 @@ import os
 import sys
 import time
 
-from mqa_cv.config import Config
-from mqa_cv.db import Database
-from mqa_cv.hub import HubClient
-from mqa_cv.profiles import (
+from src.config import Config
+from src.db import Database
+from src.hub import HubClient
+from src.profiles import (
     ProfileSource,
     discover_profiles,
     ordered_validation_groups,
     ordered_validation_plan,
 )
-from mqa_cv.validator import ShaclValidatorClient
+from src.validator import ShaclValidatorClient
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -185,7 +185,7 @@ def _save_result(
 
 
 def _save_skipped(db: Database, dataset_id: str, validator_url: str, profile: str, prerequisite: str) -> None:
-    from mqa_cv.validator import ValidationResult
+    from src.validator import ValidationResult
 
     result = ValidationResult(
         shape_model=profile,
@@ -355,7 +355,7 @@ def show_report_details(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="MQA Cross-Version Validator: discovery, RDF acquisition and SHACL validation as separate commands"
+        description="DCAT-AP Cross-Version Validator for EU MQA: cross-version validation using the EU MQA SHACL validator"
     )
     subparsers = parser.add_subparsers(dest="command")
 
