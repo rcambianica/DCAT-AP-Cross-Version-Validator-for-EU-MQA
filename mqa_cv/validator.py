@@ -133,7 +133,7 @@ class ShaclValidatorClient:
         self.request_delay = max(0.0, request_delay)
         self.session = requests.Session()
         self.session.headers.update(
-            {"User-Agent": "mqa-cross-version/0.4.3 (+research; SHACL validator)"}
+            {"User-Agent": "mqa-cross-version (+research; sequential SHACL validation)"}
         )
 
         # Per il validator locale i retry sono disabilitati di default. Se l'utente

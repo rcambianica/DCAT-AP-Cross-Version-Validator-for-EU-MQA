@@ -19,10 +19,15 @@ class Database:
         does not close the connection. Explicit closure matters when validating
         large queues with many short database operations.
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
         try:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA busy_timeout = 30000")
+            # WAL permits readers while short database writes are committed.
+            # NORMAL keeps the research database durable against process crashes;
+            # the most recent transaction can be lost only on OS/power failure.
+            conn.execute("PRAGMA synchronous = NORMAL")
             yield conn
             conn.commit()
         except BaseException:
@@ -40,10 +45,12 @@ class Database:
     def init_schema(self) -> None:
         """Create tables and migrate older project databases in-place."""
         with self.get_connection() as conn:
+            conn.execute("PRAGMA journal_mode = WAL")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS datasets (
                     dataset_id TEXT PRIMARY KEY,
                     catalogue_id TEXT,
+                    category_id TEXT,
                     source_url TEXT,
                     rdf_path TEXT,
                     sha256 TEXT,
@@ -61,6 +68,7 @@ class Database:
             columns = {r["name"] for r in conn.execute("PRAGMA table_info(datasets)")}
             migrations = {
                 "position": "INTEGER",
+                "category_id": "TEXT",
                 "discovered_at": "TIMESTAMP",
                 "fetched_at": "TIMESTAMP",
                 "validation_status": "TEXT NOT NULL DEFAULT 'pending'",
@@ -167,8 +175,10 @@ class Database:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_datasets_queue ON datasets(fetch_status, validation_status, position, dataset_id)")
             conn.commit()
 
-    def add_discovered_datasets(self, dataset_ids: list[str], catalogue_id: str) -> tuple[int, int]:
-        """Upsert discovered IDs and assign deterministic positions efficiently.
+    def add_discovered_datasets(
+        self, dataset_ids: list[str], catalogue_id: str, category_id: str | None = None,
+    ) -> tuple[int, int]:
+        """Upsert discovered IDs, record the selected category, and assign positions.
 
         Existing fetch/validation state is preserved. Positions are based on
         lexical ordering of dataset IDs within the catalogue, so the processing
@@ -192,11 +202,19 @@ class Database:
             conn.executemany(
                 """
                 INSERT OR IGNORE INTO datasets
-                    (dataset_id, catalogue_id, fetch_status, validation_status)
-                VALUES (?, ?, 'pending', 'pending')
+                    (dataset_id, catalogue_id, category_id, fetch_status, validation_status)
+                VALUES (?, ?, ?, 'pending', 'pending')
                 """,
-                [(dataset_id, catalogue_id) for dataset_id in unique_ids],
+                [(dataset_id, catalogue_id, category_id) for dataset_id in unique_ids],
             )
+            # When discovery is category-filtered, record the selected category
+            # for both new and already-known datasets. Unfiltered discovery does
+            # not erase a category recorded by an earlier filtered discovery.
+            if category_id is not None:
+                conn.executemany(
+                    "UPDATE datasets SET category_id=? WHERE dataset_id=? AND catalogue_id=?",
+                    [(category_id, dataset_id, catalogue_id) for dataset_id in unique_ids],
+                )
 
             # SQLite performs the complete deterministic re-numbering in SQL;
             # this avoids fetching and updating tens of thousands of rows in Python.

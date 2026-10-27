@@ -5,3 +5,5 @@ analysis.db
 data/rdf/*.ttl
 reports/*.csv
 reports/*.md
+data/
+*.egg-info

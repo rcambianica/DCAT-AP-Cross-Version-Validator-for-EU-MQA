@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mqa-cross-version-validator"
+description = "MQA Cross-Version Validator for dataset discovery and SHACL validation"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31,<3",
+    "rdflib>=7.0,<8",
+    "PyYAML>=6.0,<7",
+]
+
+[project.scripts]
+mqa_cv = "mqa_cv.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["mqa_cv*"]

@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import sys
+import time
 
 from mqa_cv.config import Config
 from mqa_cv.db import Database
@@ -32,20 +33,64 @@ def _clients(cfg: Config):
     return hub, db
 
 
-def discover_datasets(catalogue_id: str | None = None, limit: int | None = None) -> None:
-    """Discover dataset IDs only. No RDF is downloaded and nothing is validated."""
+def list_categories(catalogue_id: str | None = None) -> None:
+    """Print category IDs and labels discovered dynamically from Hub Search."""
+    cfg = Config()
+    if catalogue_id:
+        cfg.catalogue_id = catalogue_id
+    hub = HubClient(
+        search_base_url=cfg.search_base_url,
+        repo_base_url=cfg.repo_base_url,
+        timeout=cfg.timeout,
+    )
+    categories = hub.get_categories(cfg.catalogue_id)
+    print("ID\tDATASET COUNT\tCATEGORY")
+    for category in categories:
+        print(f"{category['id']}\t{category['count']}\t{category['label']}")
+
+
+def discover_datasets(
+    catalogue_id: str | None = None,
+    category_id: str | None = None,
+    limit: int | None = None,
+) -> None:
+    """Discover dataset IDs, optionally restricted to one Hub Search category."""
     cfg = Config()
     if catalogue_id:
         cfg.catalogue_id = catalogue_id
 
     hub, db = _clients(cfg)
-    logger.info("Discovering dataset IDs: catalogue=%s", cfg.catalogue_id)
-    all_ids = hub.get_dataset_ids(cfg.catalogue_id)
-    ids = all_ids[:limit] if limit is not None else all_ids
-    inserted, total = db.add_discovered_datasets(ids, cfg.catalogue_id)
+    if category_id:
+        available = hub.get_categories(cfg.catalogue_id)
+        category = next(
+            (item for item in available if item["id"].casefold() == category_id.casefold()
+             or item["label"].casefold() == category_id.casefold()),
+            None,
+        )
+        if category is None:
+            choices = ", ".join(f"{item['id']} ({item['label']})" for item in available)
+            raise SystemExit(f"Categoria non riconosciuta: {category_id}. Disponibili: {choices}")
+        selected_id = category["id"]
+        logger.info(
+            "Discovering dataset IDs: catalogue=%s category=%s (%s)",
+            cfg.catalogue_id, selected_id, category["label"],
+        )
+        all_ids = hub.get_dataset_ids_by_category(
+            cfg.catalogue_id, selected_id, limit=limit
+        )
+        ids = all_ids
+    else:
+        logger.info("Discovering dataset IDs: catalogue=%s category=all", cfg.catalogue_id)
+        all_ids = hub.get_dataset_ids(cfg.catalogue_id)
+        ids = all_ids[:limit] if limit is not None else all_ids
+
+    selected_category_id = selected_id if category_id else None
+    inserted, total = db.add_discovered_datasets(
+        ids, cfg.catalogue_id, category_id=selected_category_id
+    )
     logger.info(
-        "Discovery completed: received=%d new=%d inventory_total=%d",
-        len(ids), inserted, total,
+        "Discovery completed: category=%s received=%d new=%d inventory_total=%d",
+        category_id or "all", len(ids), inserted, total,
     )
 
 
@@ -174,7 +219,7 @@ def _run_chain(
     validator/network/report error prevents deciding the prerequisite.
     """
     for index, profile in enumerate(chain):
-        logger.info("[%s] SHACL validation: %s", dataset_id, profile)
+        logger.debug("[%s] SHACL validation: %s", dataset_id, profile)
         result = validator.validate(rdf_data=rdf_bytes, shape_model=profile)
 
         if result.http_status == 200 and result.conforms is not None and not result.error:
@@ -207,24 +252,28 @@ def _run_chain(
 
 
 def run_validation(limit: int | None = None) -> int:
-    """Validate already-fetched RDF using the local SHACL validator only."""
+    """Validate fetched RDF sequentially through the unmodified SHACL service."""
     cfg = Config()
     if os.environ.get("MQA_SHACL_VALIDATOR_URL"):
         cfg.validator_url = os.environ["MQA_SHACL_VALIDATOR_URL"]
+
     _, db = _clients(cfg)
     _, groups = _load_validation_profiles(cfg)
     profiles = [profile for group in groups for profile in group]
+    validator = ShaclValidatorClient(
+        endpoint=cfg.validator_url,
+        timeout=cfg.validator_timeout,
+    )
 
-    validator = ShaclValidatorClient(endpoint=cfg.validator_url, timeout=cfg.validator_timeout)
     rows = db.get_pending_validation(cfg.validator_url, profiles, limit)
-    logger.info("SHACL validation queue: %d dataset(s)", len(rows))
+    logger.info("SHACL validation queue: %d dataset(s); execution=sequential", len(rows))
     completed = 0
+    started = time.monotonic()
 
     for idx, row in enumerate(rows, 1):
         dataset_id = row["dataset_id"]
         rdf_path = row["rdf_path"]
         logger.info("[run %d/%d] %s", idx, len(rows), dataset_id)
-
         db.update_validation_status(dataset_id, "validating", None)
 
         try:
@@ -235,12 +284,13 @@ def run_validation(limit: int | None = None) -> int:
             for chain in groups:
                 if not _run_chain(db, validator, dataset_id, cfg.validator_url, rdf_bytes, chain):
                     all_chains_terminal = False
-                    # An operation error is not equivalent to non-conformity;
-                    # continue with independent DCAT versions so other results
-                    # are still collected for the experiment.
+                    # A technical error is not non-conformity. Continue with other
+                    # independent profile chains so the run preserves useful results.
                     continue
 
-            if all_chains_terminal and db.mark_completed_if_validated(dataset_id, cfg.validator_url, profiles):
+            if all_chains_terminal and db.mark_completed_if_validated(
+                dataset_id, cfg.validator_url, profiles
+            ):
                 completed += 1
             else:
                 db.update_validation_status(
@@ -248,15 +298,27 @@ def run_validation(limit: int | None = None) -> int:
                     "validation_error",
                     "One or more profile validation operations failed; retry required",
                 )
-                logger.warning(
-                    "Validation incomplete for %s; it remains eligible for retry",
-                    dataset_id,
-                )
+                logger.warning("Validation incomplete for %s; eligible for retry", dataset_id)
         except Exception as exc:
             logger.exception("Validation failed for %s", dataset_id)
             db.update_validation_status(dataset_id, "validation_error", str(exc))
 
-    logger.info("Validation completed: successful=%d failed/incomplete=%d", completed, len(rows) - completed)
+        if idx % 10 == 0 or idx == len(rows):
+            elapsed = max(time.monotonic() - started, 0.001)
+            rate = idx / elapsed
+            remaining = len(rows) - idx
+            eta = remaining / rate if rate else 0
+            logger.info(
+                "Validation progress: %d/%d; completed=%d; elapsed=%.1f min; ETA=%.1f min",
+                idx, len(rows), completed, elapsed / 60, eta / 60,
+            )
+
+    elapsed = time.monotonic() - started
+    logger.info(
+        "Validation completed: successful=%d failed/incomplete=%d; "
+        "execution=sequential; elapsed=%.1f min",
+        completed, len(rows) - completed, elapsed / 60,
+    )
     return completed
 
 
@@ -302,18 +364,23 @@ def main() -> None:
         help="Recupera solo gli ID dei dataset tramite Hub Search e li salva nell'inventario SQLite",
     )
     discover_parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help=(
-            "Limita gli ID persistiti dopo il recupero completo dall'API "
-            "(utile per test; non riduce il tempo della richiesta HTTP)"
-        ),
+        "--limit", type=int, default=None,
+        help="Numero massimo di dataset da inserire (con --category limita anche la paginazione API)",
     )
     discover_parser.add_argument(
-        "--catalogue",
-        default=None,
+        "--catalogue", default=None,
         help="Hub catalogue ID (default: dati-gov-it)",
+    )
+    discover_parser.add_argument(
+        "--category", default=None,
+        help="Categoria Hub Search (ID come ENVI oppure etichetta italiana come Ambiente)",
+    )
+
+    categories_parser = subparsers.add_parser(
+        "categories", help="Elenca dinamicamente le categorie disponibili nel catalogo",
+    )
+    categories_parser.add_argument(
+        "--catalogue", default=None, help="Hub catalogue ID (default: dati-gov-it)",
     )
 
     fetch_parser = subparsers.add_parser(
@@ -355,7 +422,9 @@ def main() -> None:
             parser.error("--limit deve essere maggiore di zero")
 
     if args.command == "discover":
-        discover_datasets(catalogue_id=args.catalogue, limit=args.limit)
+        discover_datasets(catalogue_id=args.catalogue, category_id=args.category, limit=args.limit)
+    elif args.command == "categories":
+        list_categories(catalogue_id=args.catalogue)
     elif args.command == "fetch":
         fetch_datasets(limit=args.limit)
     elif args.command == "run":
