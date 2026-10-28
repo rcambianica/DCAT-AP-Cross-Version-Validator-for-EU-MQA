@@ -83,14 +83,19 @@ class ValidationReportTests(unittest.TestCase):
                 violations=result.violations, warnings=result.warnings, infos=result.infos,
                 http_status=result.http_status, error=result.error, execution_status="validated",
                 report_body=result.report_body, report_content_type=result.report_content_type,
-                report_parsed=result.report_metadata_json is not None,
-                report_metadata_json=result.report_metadata_json,
+                report_parsed=result.report_parsed,
                 validation_details=result.validation_details,
             )
 
             with db.get_connection() as conn:
                 validation = conn.execute("SELECT * FROM validations").fetchone()
                 detail = conn.execute("SELECT * FROM validation_results").fetchone()
+                validation_columns = {row["name"] for row in conn.execute("PRAGMA table_info(validations)")}
+                detail_columns = {row["name"] for row in conn.execute("PRAGMA table_info(validation_results)")}
+            self.assertNotIn("report_metadata_json", validation_columns)
+            self.assertNotIn("report_size_bytes", validation_columns)
+            self.assertNotIn("report_compressed_size_bytes", validation_columns)
+            self.assertNotIn("result_index", detail_columns)
             self.assertEqual(validation["report_format"], "turtle")
             self.assertTrue(validation["report_body_gzip"])
             self.assertTrue(validation["report_saved_at"])
@@ -118,12 +123,29 @@ class ValidationReportTests(unittest.TestCase):
                     id INTEGER PRIMARY KEY AUTOINCREMENT, dataset_id TEXT, validator_url TEXT, shape_model TEXT,
                     conforms INTEGER, results INTEGER, violations INTEGER, warnings INTEGER, infos INTEGER,
                     http_status INTEGER, error TEXT, execution_status TEXT NOT NULL DEFAULT 'validated',
+                    report_sha256 TEXT, report_size_bytes INTEGER,
+                    report_compressed_size_bytes INTEGER, report_content_type TEXT, report_format TEXT,
+                    report_metadata_json TEXT, report_saved_at TIMESTAMP,
                     validated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, UNIQUE(dataset_id,validator_url,shape_model)
                 );
+                CREATE TABLE validation_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, validation_id INTEGER NOT NULL,
+                    result_index INTEGER NOT NULL, result_node TEXT, focus_node TEXT, result_path TEXT,
+                    value TEXT, source_shape TEXT, source_constraint_component TEXT, severity TEXT,
+                    message TEXT, properties_json TEXT NOT NULL,
+                    FOREIGN KEY(validation_id) REFERENCES validations(id) ON DELETE CASCADE,
+                    UNIQUE(validation_id,result_index)
+                );
+                CREATE INDEX idx_validation_results_severity ON validation_results(severity,source_constraint_component);
+                CREATE INDEX idx_validation_results_focus_path ON validation_results(focus_node,result_path);
                 INSERT INTO datasets(dataset_id,catalogue_id,fetch_status,rdf_path,validation_status)
                     VALUES ('old-dataset','catalogue','ok','data/rdf/old.ttl','completed');
-                INSERT INTO validations(dataset_id,validator_url,shape_model,conforms,results,violations,warnings,infos,http_status,execution_status)
-                    VALUES ('old-dataset','http://localhost:8080/shacl/validation/report','dcatap301level1',0,1,1,0,0,200,'validated');
+                INSERT INTO validations(dataset_id,validator_url,shape_model,conforms,results,violations,warnings,infos,http_status,execution_status,report_sha256,report_size_bytes,report_compressed_size_bytes,report_metadata_json)
+                    VALUES ('old-dataset','http://localhost:8080/shacl/validation/report','dcatap301level1',0,2,2,0,0,200,'validated','legacy-hash',100,80,'[{""node"":""report""}]');
+                INSERT INTO validation_results(validation_id,result_index,result_node,focus_node,severity,message,properties_json)
+                    VALUES (1,2,'urn:result:2','urn:focus:2','Violation','second','{}');
+                INSERT INTO validation_results(validation_id,result_index,result_node,focus_node,severity,message,properties_json)
+                    VALUES (1,1,'urn:result:1','urn:focus:1','Violation','first','{}');
             """)
             conn.commit()
             conn.close()
@@ -133,9 +155,25 @@ class ValidationReportTests(unittest.TestCase):
             with db.get_connection() as conn:
                 state = conn.execute("SELECT validation_status FROM datasets WHERE dataset_id='old-dataset'").fetchone()[0]
                 columns = {row["name"] for row in conn.execute("PRAGMA table_info(validations)")}
+                result_columns = {row["name"] for row in conn.execute("PRAGMA table_info(validation_results)")}
+                preserved = conn.execute("SELECT result_node,message FROM validation_results ORDER BY id").fetchall()
+                digest = conn.execute("SELECT report_sha256 FROM validations WHERE dataset_id='old-dataset'").fetchone()[0]
             self.assertEqual(state, "pending")
             self.assertIn("report_body_gzip", columns)
-            self.assertIn("report_metadata_json", columns)
+            self.assertIn("report_sha256", columns)
+            self.assertNotIn("report_metadata_json", columns)
+            self.assertNotIn("report_size_bytes", columns)
+            self.assertNotIn("report_compressed_size_bytes", columns)
+            self.assertNotIn("result_index", result_columns)
+            self.assertEqual(digest, "legacy-hash")
+            self.assertEqual([(row["result_node"], row["message"]) for row in preserved], [
+                ("urn:result:1", "first"), ("urn:result:2", "second")
+            ])
+            # The migration is idempotent and does not lose normalized results.
+            db.init_schema()
+            with db.get_connection() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM validation_results").fetchone()[0], 2)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM validations").fetchone()[0], 1)
 
     def test_http_400_body_can_be_retained_for_diagnosis(self):
         body = b"Could not initialize class io.piveau.validating.DCATAP200"

@@ -143,13 +143,22 @@ Senza `--limit` vengono elaborati tutti i dataset con RDF disponibile e una matr
 python -m dcat-ap-cv run
 ```
 
+Per impostazione predefinita, `run` valida **tutti i profili dichiarati dal validator**, anche quando un livello precedente restituisce `conforms=false`. Per attivare opzionalmente lo short-circuit:
+
+```bash
+python -m dcat-ap-cv run --short-circuit
+```
+
+Con `--short-circuit`, all'interno delle catene Level 1 → Level 2 → Level 3 → profilo completo, i livelli successivi vengono registrati come `skipped` dopo il primo risultato non conforme. La modalità completa predefinita considera invece tali record `skipped` come ancora da validare, così un dataset già elaborato con lo short-circuit viene ripreso ed eseguito su tutti i profili.
+
 `run` non esegue discovery e non scarica dataset.
 
 #### Esecuzione sequenziale
 
 La validazione è deliberatamente sequenziale: MQA elabora un dataset alla volta e invia una richiesta HTTP alla volta al servizio SHACL.
-All'interno di ciascuna catena, i profili Level 1 → Level 2 → Level 3 → profilo completo sono anch'essi eseguiti in sequenza; se un livello
-restituisce `conforms=false`, i livelli successivi della stessa catena vengono registrati come `skipped`.
+All'interno di ciascuna catena, i profili Level 1 → Level 2 → Level 3 → profilo completo sono eseguiti in sequenza. Solo con l'opzione
+`--short-circuit`, se un livello restituisce `conforms=false`, i livelli successivi della stessa catena vengono registrati come `skipped`;
+la modalità predefinita esegue ogni profilo indipendentemente dall'esito di quelli precedenti.
 
 Non esiste più il parametro `--workers` né la variabile `MQA_VALIDATION_WORKERS`. Questa scelta riduce la complessità della pipeline e
 facilita la descrizione e la riproducibilità degli esperimenti. Non implica che l'esecuzione sequenziale sia più veloce: i benchmark
@@ -263,16 +272,18 @@ La tabella `validations` contiene il risultato o lo stato di esecuzione per ogni
 
 Oltre ai dati aggregati del report SHACL, la v0.4.3 conserva il corpo originale e indicizza ogni risultato individuale.
 
-- `validations`: esito aggregato per dataset e profilo, contatori, stato HTTP, errore, checksum SHA-256, dimensione originale/compattata,
-  Content-Type, formato e metadati del nodo `sh:ValidationReport`. Il corpo originale della risposta è conservato nella colonna
-  `report_body_gzip` come BLOB compresso con gzip.
+- `validations`: esito aggregato per dataset e profilo, contatori, stato HTTP, errore, checksum SHA-256, Content-Type e formato.
+  Il corpo originale della risposta è conservato nella colonna `report_body_gzip` come BLOB compresso con gzip; le dimensioni sono
+  ricavabili dal BLOB e dal corpo decompresso, quindi non vengono duplicate in colonne dedicate.
 - `validation_results`: una riga per ciascun nodo `sh:ValidationResult`, con focus node, property path, value, source shape, constraint
   component, severity e messaggi. Il campo `properties_json` conserva **tutte le proprietà RDF direttamente associate al risultato**,
-  comprese quelle non previste dalle colonne principali, con datatype e language tag dei literal.
+  comprese quelle non previste dalle colonne principali, con datatype e language tag dei literal. I risultati vengono ordinati in modo
+  deterministico all'estrazione e persistiti in tale ordine; non serve una colonna `result_index`.
 
 Ho scelto un BLOB compresso in `analysis.db` invece di un file per ogni coppia dataset/profilo: con decine di migliaia di dataset, la
 soluzione a file separati rischierebbe di creare centinaia di migliaia di piccoli file. Il report completo e i dettagli indicizzati vengono
-salvati nella stessa transazione SQLite, mentre gzip limita lo spazio richiesto. Per corpi HTTP d'errore viene salvata la risposta
+salvati nella stessa transazione SQLite, mentre gzip limita lo spazio richiesto. Il checksum SHA-256 viene calcolato sul corpo originale
+non compresso; i metadati del nodo `sh:ValidationReport` non vengono duplicati in JSON perché sono già presenti nel report originale. Per corpi HTTP d'errore viene salvata la risposta
 originale, utile alla diagnosi; gli errori di rete senza risposta non hanno un corpo da conservare. Il checksum SHA-256 si riferisce al
 corpo originale non compresso.
 
@@ -434,8 +445,7 @@ Il database è quindi la fonte strutturata dei risultati dell'esperimento.
 ## Nota metodologica
 
 La metodologia MQA distingue esplicitamente quattro configurazioni SHACL: Level 1 (Base), Level 2 (Base + vocabolari), Level 3 (Base +
-vocabolari + proprietà raccomandate) e All shapes (con anche i ranges). Questa struttura è alla base dello short-circuit implementato nel
-progetto.
+vocabolari + proprietà raccomandate) e All shapes (con anche i ranges). Questa struttura motiva l'opzione `--short-circuit`, disattivata per impostazione predefinita; non è una prova che il servizio MQA stesso interrompa le validazioni successive.
 
 Il progetto non scarica direttamente i metadata da `dati.gov.it`. I metadata sono quelli del catalogo `dati-gov-it` presenti nel piveau Hub
 di data.europa.eu.

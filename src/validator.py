@@ -26,7 +26,7 @@ class ValidationResult:
     error: str | None = None
     report_body: bytes | None = None
     report_content_type: str | None = None
-    report_metadata_json: str | None = None
+    report_parsed: bool = False
     validation_details: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -69,19 +69,12 @@ def _properties_for_subject(graph: Graph, subject: Any) -> dict[str, list[dict[s
     return dict(sorted(properties.items()))
 
 
-def _extract_report_data(graph: Graph) -> tuple[str | None, list[dict[str, Any]]]:
-    """Extract report-level triples and every sh:ValidationResult property.
+def _extract_report_data(graph: Graph) -> list[dict[str, Any]]:
+    """Extract every sh:ValidationResult and its direct RDF properties.
 
-    The original RDF body is retained as a compressed BLOB in SQLite. The JSON representation is a queryable
-    index that preserves all direct properties of each result node, including
-    properties beyond the common SHACL fields.
+    The original RDF body is retained as a compressed BLOB in SQLite. The JSON
+    representation is a queryable index for properties not covered by columns.
     """
-    report_nodes = sorted(set(graph.subjects(RDF.type, SH.ValidationReport)), key=str)
-    metadata = [
-        {"node": str(node), "properties": _properties_for_subject(graph, node)}
-        for node in report_nodes
-    ]
-
     result_nodes = set(graph.subjects(RDF.type, SH.ValidationResult))
     details: list[dict[str, Any]] = []
     for node in result_nodes:
@@ -94,7 +87,6 @@ def _extract_report_data(graph: Graph) -> tuple[str | None, list[dict[str, Any]]
         severity_iri = _term_text(graph, node, SH.resultSeverity)
         messages = sorted(str(item) for item in graph.objects(node, SH.resultMessage))
         details.append({
-            "result_index": 0,  # Assigned after a stable, content-based sort below.
             "result_node": str(node),
             "focus_node": focus,
             "result_path": path,
@@ -106,18 +98,14 @@ def _extract_report_data(graph: Graph) -> tuple[str | None, list[dict[str, Any]]
             "properties_json": json.dumps(properties, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
         })
 
-    # Sort mostly by semantic fields for human-friendly output. result_index is
-    # an ordinal inside this one report, not a persistent identifier across runs.
+    # RDF graphs are unordered: sort results by semantic content for stable
+    # persistence and output ordering across equivalent reports.
     stable_fields = (
         "focus_node", "result_path", "severity", "source_constraint_component",
         "value", "source_shape", "message", "properties_json",
     )
     details.sort(key=lambda item: tuple(item.get(field) or "" for field in stable_fields))
-    for index, detail in enumerate(details, start=1):
-        detail["result_index"] = index
-
-    metadata_json = json.dumps(metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return metadata_json, details
+    return details
 
 
 class ShaclValidatorClient:
@@ -252,7 +240,7 @@ class ShaclValidatorClient:
             if SH.Info in severities:
                 infos += 1
 
-        report_metadata_json, validation_details = _extract_report_data(graph)
+        validation_details = _extract_report_data(graph)
 
         return ValidationResult(
             shape_model=shape_model,
@@ -264,6 +252,6 @@ class ShaclValidatorClient:
             http_status=response.status_code,
             report_body=response.content or None,
             report_content_type=response.headers.get("Content-Type"),
-            report_metadata_json=report_metadata_json,
+            report_parsed=True,
             validation_details=validation_details,
         )

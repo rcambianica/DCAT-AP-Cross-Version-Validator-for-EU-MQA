@@ -96,11 +96,8 @@ class Database:
                     execution_status TEXT NOT NULL DEFAULT 'validated',
                     report_body_gzip BLOB,
                     report_sha256 TEXT,
-                    report_size_bytes INTEGER,
-                    report_compressed_size_bytes INTEGER,
                     report_content_type TEXT,
                     report_format TEXT,
-                    report_metadata_json TEXT,
                     report_saved_at TIMESTAMP,
                     validated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (dataset_id) REFERENCES datasets (dataset_id),
@@ -117,11 +114,8 @@ class Database:
             report_columns = {
                 "report_body_gzip": "BLOB",
                 "report_sha256": "TEXT",
-                "report_size_bytes": "INTEGER",
-                "report_compressed_size_bytes": "INTEGER",
                 "report_content_type": "TEXT",
                 "report_format": "TEXT",
-                "report_metadata_json": "TEXT",
                 "report_saved_at": "TIMESTAMP",
             }
             reports_need_migration = any(name not in validations_columns for name in report_columns)
@@ -129,11 +123,17 @@ class Database:
                 if name not in validations_columns:
                     conn.execute(f"ALTER TABLE validations ADD COLUMN {name} {definition}")
 
+            # Remove report fields that are derivable from the BLOB or unused by
+            # the analysis. SQLite DROP COLUMN preserves the remaining records.
+            validations_columns = {r["name"] for r in conn.execute("PRAGMA table_info(validations)")}
+            for name in ("report_size_bytes", "report_compressed_size_bytes", "report_metadata_json"):
+                if name in validations_columns:
+                    conn.execute(f"ALTER TABLE validations DROP COLUMN {name}")
+
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS validation_results (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     validation_id INTEGER NOT NULL,
-                    result_index INTEGER NOT NULL,
                     result_node TEXT,
                     focus_node TEXT,
                     result_path TEXT,
@@ -143,10 +143,45 @@ class Database:
                     severity TEXT,
                     message TEXT,
                     properties_json TEXT NOT NULL,
-                    FOREIGN KEY (validation_id) REFERENCES validations(id) ON DELETE CASCADE,
-                    UNIQUE(validation_id, result_index)
+                    FOREIGN KEY (validation_id) REFERENCES validations(id) ON DELETE CASCADE
                 )
             """)
+            # Drop result_index and its UNIQUE constraint from older schemas.
+            # Results are already sorted deterministically by the parser and are
+            # inserted in that order; the row id now provides stable query order.
+            result_columns = {r["name"] for r in conn.execute("PRAGMA table_info(validation_results)")}
+            if "result_index" in result_columns:
+                conn.execute("DROP INDEX IF EXISTS idx_validation_results_severity")
+                conn.execute("DROP INDEX IF EXISTS idx_validation_results_focus_path")
+                conn.execute("ALTER TABLE validation_results RENAME TO validation_results_legacy")
+                conn.execute("""
+                    CREATE TABLE validation_results (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        validation_id INTEGER NOT NULL,
+                        result_node TEXT,
+                        focus_node TEXT,
+                        result_path TEXT,
+                        value TEXT,
+                        source_shape TEXT,
+                        source_constraint_component TEXT,
+                        severity TEXT,
+                        message TEXT,
+                        properties_json TEXT NOT NULL,
+                        FOREIGN KEY (validation_id) REFERENCES validations(id) ON DELETE CASCADE
+                    )
+                """)
+                conn.execute("""
+                    INSERT INTO validation_results (
+                        validation_id,result_node,focus_node,result_path,value,source_shape,
+                        source_constraint_component,severity,message,properties_json
+                    )
+                    SELECT validation_id,result_node,focus_node,result_path,value,source_shape,
+                           source_constraint_component,severity,message,properties_json
+                    FROM validation_results_legacy
+                    ORDER BY validation_id,result_index,id
+                """)
+                conn.execute("DROP TABLE validation_results_legacy")
+
             # Idempotently repair any historical rows whose error field already
             # proves that the validation operation did not complete successfully.
             conn.execute("UPDATE validations SET execution_status='error' WHERE error IS NOT NULL AND TRIM(error) <> '' AND execution_status='validated'")
@@ -260,17 +295,21 @@ class Database:
         validator_url: str,
         profiles: list[str],
         limit: int | None = None,
+        *,
+        allow_skipped: bool = True,
     ) -> list[sqlite3.Row]:
         """Select RDF-ready datasets whose validation matrix is incomplete.
 
-        A dataset is eligible when at least one expected profile has neither a
-        successful validation nor an explicit skip record for the configured
-        validator. This also makes a change in the discovered OpenAPI profiles
-        visible on subsequent runs.
+        When ``allow_skipped`` is false, every expected profile must have a
+        successful validation. This is used by the default full-validation run
+        to revisit datasets previously processed with short-circuiting.
         """
         if not profiles:
             return []
         placeholders = ",".join("?" for _ in profiles)
+        completed_predicate = "(v.execution_status='validated' AND v.http_status=200 AND v.conforms IS NOT NULL AND v.error IS NULL)"
+        if allow_skipped:
+            completed_predicate = f"(v.execution_status='skipped' OR {completed_predicate})"
         sql = f"""
             SELECT d.*
             FROM datasets d
@@ -283,10 +322,7 @@ class Database:
                         WHERE v.dataset_id=d.dataset_id
                           AND v.validator_url=?
                           AND v.shape_model IN ({placeholders})
-                          AND (
-                                v.execution_status='skipped'
-                                OR (v.execution_status='validated' AND v.http_status=200 AND v.conforms IS NOT NULL AND v.error IS NULL)
-                              )
+                          AND {completed_predicate}
                     ) < ?
                   )
             ORDER BY d.position ASC, d.dataset_id ASC
@@ -365,7 +401,6 @@ class Database:
         report_body: bytes | None = None,
         report_content_type: str | None = None,
         report_parsed: bool = False,
-        report_metadata_json: str | None = None,
         validation_details: list[dict] | None = None,
     ) -> None:
         """Upsert a validation and its gzip-compressed original report.
@@ -382,32 +417,27 @@ class Database:
         details = validation_details or []
         compressed_body = gzip.compress(report_body, compresslevel=6, mtime=0) if report_body else None
         report_sha256 = hashlib.sha256(report_body).hexdigest() if report_body else None
-        report_size = len(report_body) if report_body else None
-        report_compressed_size = len(compressed_body) if compressed_body else None
         report_format = self._report_format(report_content_type, report_parsed) if report_body else None
 
         with self.get_connection() as conn:
             conn.execute("""
                 INSERT INTO validations (
                     dataset_id,validator_url,shape_model,conforms,results,violations,warnings,infos,
-                    http_status,error,execution_status,report_body_gzip,report_sha256,report_size_bytes,
-                    report_compressed_size_bytes,report_content_type,report_format,report_metadata_json,report_saved_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)
+                    http_status,error,execution_status,report_body_gzip,report_sha256,
+                    report_content_type,report_format,report_saved_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)
                 ON CONFLICT(dataset_id,validator_url,shape_model) DO UPDATE SET
                     conforms=excluded.conforms,results=excluded.results,violations=excluded.violations,
                     warnings=excluded.warnings,infos=excluded.infos,http_status=excluded.http_status,
                     error=excluded.error,execution_status=excluded.execution_status,
                     report_body_gzip=excluded.report_body_gzip,report_sha256=excluded.report_sha256,
-                    report_size_bytes=excluded.report_size_bytes,
-                    report_compressed_size_bytes=excluded.report_compressed_size_bytes,
                     report_content_type=excluded.report_content_type,report_format=excluded.report_format,
-                    report_metadata_json=excluded.report_metadata_json,
                     report_saved_at=CASE WHEN excluded.report_body_gzip IS NOT NULL THEN CURRENT_TIMESTAMP ELSE NULL END,
                     validated_at=CURRENT_TIMESTAMP
             """, (
                 dataset_id, validator_url, shape_model, conforms_val, results, violations, warnings, infos,
-                http_status, error, execution_status, compressed_body, report_sha256, report_size,
-                report_compressed_size, report_content_type, report_format, report_metadata_json,
+                http_status, error, execution_status, compressed_body, report_sha256,
+                report_content_type, report_format,
             ))
             validation_id = conn.execute(
                 "SELECT id FROM validations WHERE dataset_id=? AND validator_url=? AND shape_model=?",
@@ -422,17 +452,17 @@ class Database:
             if details:
                 conn.executemany("""
                     INSERT INTO validation_results (
-                        validation_id,result_index,result_node,focus_node,result_path,value,source_shape,
+                        validation_id,result_node,focus_node,result_path,value,source_shape,
                         source_constraint_component,severity,message,properties_json
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?)
                 """, [
                     (
-                        validation_id, detail.get("result_index", index), detail.get("result_node"),
-                        detail.get("focus_node"), detail.get("result_path"), detail.get("value"),
-                        detail.get("source_shape"), detail.get("source_constraint_component"),
-                        detail.get("severity"), detail.get("message"), detail.get("properties_json", "{}"),
+                        validation_id, detail.get("result_node"), detail.get("focus_node"),
+                        detail.get("result_path"), detail.get("value"), detail.get("source_shape"),
+                        detail.get("source_constraint_component"), detail.get("severity"),
+                        detail.get("message"), detail.get("properties_json", "{}"),
                     )
-                    for index, detail in enumerate(details, start=1)
+                    for detail in details
                 ])
             conn.commit()
 
@@ -441,8 +471,7 @@ class Database:
         with self.get_connection() as conn:
             return conn.execute("""
                 SELECT report_body_gzip,report_content_type,report_format,report_sha256,
-                       report_size_bytes,report_compressed_size_bytes,report_saved_at,
-                       http_status,execution_status
+                       report_saved_at,http_status,execution_status
                 FROM validations
                 WHERE dataset_id=? AND shape_model=? AND report_body_gzip IS NOT NULL
                 ORDER BY validated_at DESC LIMIT 1
@@ -455,10 +484,9 @@ class Database:
         """Query indexed SHACL result details for qualitative investigation."""
         sql = """
             SELECT d.dataset_id, v.shape_model, v.conforms, v.violations, v.warnings, v.infos,
-                   v.http_status, v.report_sha256, v.report_size_bytes,
-                   v.report_compressed_size_bytes, v.report_content_type, v.report_format,
+                   v.http_status, v.report_sha256, v.report_content_type, v.report_format,
                    v.report_saved_at, v.validated_at,
-                   r.result_index, r.result_node, r.focus_node, r.result_path, r.value,
+                   r.result_node, r.focus_node, r.result_path, r.value,
                    r.source_shape, r.source_constraint_component, r.severity, r.message, r.properties_json
             FROM validation_results r
             JOIN validations v ON v.id=r.validation_id
@@ -475,7 +503,7 @@ class Database:
         if severity:
             sql += " AND LOWER(r.severity)=LOWER(?)"
             params.append(severity)
-        sql += " ORDER BY v.validated_at DESC, d.dataset_id, v.shape_model, r.result_index LIMIT ?"
+        sql += " ORDER BY v.validated_at DESC, d.dataset_id, v.shape_model, r.id LIMIT ?"
         params.append(max(1, min(limit, 10000)))
         with self.get_connection() as conn:
             return conn.execute(sql, tuple(params)).fetchall()
@@ -485,6 +513,8 @@ class Database:
         dataset_id: str,
         validator_url: str,
         profiles: list[str],
+        *,
+        allow_skipped: bool = True,
     ) -> bool:
         if not profiles:
             return False
@@ -501,8 +531,9 @@ class Database:
             completed_profiles = {
                 r["shape_model"]
                 for r in rows
-                if r["execution_status"] == "skipped"
-                or (
+                if (
+                    allow_skipped and r["execution_status"] == "skipped"
+                ) or (
                     r["execution_status"] == "validated"
                     and r["http_status"] == 200
                     and r["conforms"] is not None

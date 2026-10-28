@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dcat-ap-cross-version-validator-for-eu-mqa"
-version = "0.6.1"
+version = "0.6.3"
 description = "DCAT-AP Cross-Version Validator for EU MQA: cross-version validation using the EU MQA SHACL validator"
 readme = "README.md"
 requires-python = ">=3.10"

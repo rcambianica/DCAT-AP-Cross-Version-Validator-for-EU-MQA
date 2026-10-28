@@ -198,8 +198,7 @@ def _save_result(
         execution_status=execution_status,
         report_body=result.report_body,
         report_content_type=result.report_content_type,
-        report_parsed=result.report_metadata_json is not None,
-        report_metadata_json=result.report_metadata_json,
+        report_parsed=result.report_parsed,
         validation_details=result.validation_details,
     )
 
@@ -271,8 +270,8 @@ def _run_chain(
     return True
 
 
-def run_validation(limit: int | None = None) -> int:
-    """Validate fetched RDF sequentially through the unmodified SHACL service."""
+def run_validation(limit: int | None = None, short_circuit: bool = False) -> int:
+    """Validate fetched RDF; run every profile unless short-circuit is enabled."""
     cfg = Config()
     if os.environ.get("MQA_SHACL_VALIDATOR_URL"):
         cfg.validator_url = os.environ["MQA_SHACL_VALIDATOR_URL"]
@@ -285,8 +284,14 @@ def run_validation(limit: int | None = None) -> int:
         timeout=cfg.validator_timeout,
     )
 
-    rows = db.get_pending_validation(cfg.validator_url, profiles, limit)
-    logger.info("SHACL validation queue: %d dataset(s); execution=sequential", len(rows))
+    rows = db.get_pending_validation(
+        cfg.validator_url, profiles, limit, allow_skipped=short_circuit
+    )
+    mode = "short-circuit" if short_circuit else "full-validation"
+    logger.info(
+        "SHACL validation queue: %d dataset(s); execution=sequential; mode=%s",
+        len(rows), mode,
+    )
     completed = 0
     started = time.monotonic()
 
@@ -300,16 +305,32 @@ def run_validation(limit: int | None = None) -> int:
             with open(rdf_path, "rb") as f:
                 rdf_bytes = f.read()
 
-            all_chains_terminal = True
-            for chain in groups:
-                if not _run_chain(db, validator, dataset_id, cfg.validator_url, rdf_bytes, chain):
-                    all_chains_terminal = False
-                    # A technical error is not non-conformity. Continue with other
-                    # independent profile chains so the run preserves useful results.
-                    continue
+            all_operations_terminal = True
+            if short_circuit:
+                for chain in groups:
+                    if not _run_chain(db, validator, dataset_id, cfg.validator_url, rdf_bytes, chain):
+                        all_operations_terminal = False
+                        # A technical error is not non-conformity. Continue with other
+                        # independent profile chains so the run preserves useful results.
+                        continue
+            else:
+                for profile in profiles:
+                    logger.debug("[%s] SHACL validation: %s", dataset_id, profile)
+                    result = validator.validate(rdf_data=rdf_bytes, shape_model=profile)
+                    if result.http_status == 200 and result.conforms is not None and not result.error:
+                        _save_result(db, dataset_id, cfg.validator_url, result, "validated")
+                    else:
+                        all_operations_terminal = False
+                        _save_result(db, dataset_id, cfg.validator_url, result, "error")
+                        logger.error(
+                            "[%s] profile %s failed as a validator operation: %s",
+                            dataset_id,
+                            profile,
+                            result.error or f"HTTP {result.http_status}; conforms={result.conforms}",
+                        )
 
-            if all_chains_terminal and db.mark_completed_if_validated(
-                dataset_id, cfg.validator_url, profiles
+            if all_operations_terminal and db.mark_completed_if_validated(
+                dataset_id, cfg.validator_url, profiles, allow_skipped=short_circuit
             ):
                 completed += 1
             else:
@@ -336,8 +357,8 @@ def run_validation(limit: int | None = None) -> int:
     elapsed = time.monotonic() - started
     logger.info(
         "Validation completed: successful=%d failed/incomplete=%d; "
-        "execution=sequential; elapsed=%.1f min",
-        completed, len(rows) - completed, elapsed / 60,
+        "execution=sequential; mode=%s; elapsed=%.1f min",
+        completed, len(rows) - completed, mode, elapsed / 60,
     )
     return completed
 
@@ -424,6 +445,11 @@ def main() -> None:
         default=None,
         help="Numero massimo di dataset da validare",
     )
+    run_parser.add_argument(
+        "--short-circuit",
+        action="store_true",
+        help="Abilita l'interruzione dei livelli successivi quando un livello precedente non è conforme",
+    )
 
     report_parser = subparsers.add_parser(
         "reports",
@@ -448,7 +474,7 @@ def main() -> None:
     elif args.command == "fetch":
         fetch_datasets(limit=args.limit)
     elif args.command == "run":
-        run_validation(limit=args.limit)
+        run_validation(limit=args.limit, short_circuit=args.short_circuit)
     elif args.command == "reports":
         show_report_details(args.dataset_id, args.profile, args.severity, args.limit, args.raw_report)
     else:
