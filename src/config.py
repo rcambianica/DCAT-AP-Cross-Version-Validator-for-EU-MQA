@@ -26,7 +26,6 @@ class Config:
     validator_timeout: int = 120
 
     validator_openapi_path: Path | None = None
-    validator_openapi_url: str | None = None
 
     def __post_init__(self) -> None:
         # Allow isolated benchmark runs against cloned databases without

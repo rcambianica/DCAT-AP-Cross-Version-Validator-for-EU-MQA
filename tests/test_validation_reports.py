@@ -39,12 +39,19 @@ class FakeResponse:
 
 
 class ValidationReportTests(unittest.TestCase):
-    def test_german_profiles_are_excluded(self):
+    def test_german_and_orig_profiles_are_excluded(self):
         document = {"parameters": [{"name": "shapeModel", "schema": {"enum": [
-            "dcatap301level1", "dcatap301level2", "dcatap30de", "dcatap301"
+            "dcatap301level1", "dcatap301level2", "dcatap30de",
+            "dcatap121orig", "dcatap11orig", "dcatap301"
         ]}}]}
         profiles = _extract_shape_models(document)
         self.assertEqual(profiles, ["dcatap301level1", "dcatap301level2", "dcatap301"])
+
+    def test_profile_filter_is_case_insensitive_for_orig(self):
+        document = {"parameters": [{"name": "shapeModel", "schema": {"enum": [
+            "dcatap301ORIG", "dcatap301level1"
+        ]}}]}
+        self.assertEqual(_extract_shape_models(document), ["dcatap301level1"])
 
     def test_validator_extracts_individual_result_and_raw_body(self):
         client = ShaclValidatorClient("http://localhost:8080/shacl/validation/report")

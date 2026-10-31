@@ -161,19 +161,13 @@ def fetch_datasets(limit: int | None = None) -> int:
 
 
 def _load_validation_profiles(cfg: Config) -> tuple[ProfileSource, list[list[str]]]:
-    source = discover_profiles(
-        cfg.validator_openapi_path,
-        validator_endpoint=cfg.validator_url,
-        openapi_url=cfg.validator_openapi_url,
-        timeout=min(5.0, float(cfg.validator_timeout)),
-    )
+    source = discover_profiles(cfg.validator_openapi_path)
     groups = ordered_validation_groups(source.profiles)
     plan = ordered_validation_plan(source.profiles)
 
     logger.info(
-        "Validation profile source: %s%s",
+        "Validation profile source: %s",
         source.source,
-        " [BUILT-IN FALLBACK]" if source.fallback else "",
     )
     logger.info("Validation profiles (%d): %s", len(plan), ", ".join(plan))
     for group in groups:

@@ -180,45 +180,28 @@ Per questa tesi, il servizio upstream va mantenuto invariato: le sue variabili d
 purché siano documentate e i risultati siano misurati. La pipeline MQA non assume che una modifica del parallelismo lato server migliori il
 throughput.
 
-## Profili SHACL: OpenAPI prima del fallback
+## Profili SHACL: unica fonte locale di verità
 
-`run` **non utilizza più direttamente una lista fissa di profili**.
+La lista dei profili utilizzati da `run` viene letta esclusivamente dal file `openapi-shacl.yaml` presente nel checkout locale di `validating-shacl`. Il progetto non mantiene una lista incorporata di profili, non recupera l'OpenAPI via HTTP e non utilizza fallback: in questo modo la matrice di validazione riflette il file effettivamente presente nell'installazione locale del validator.
 
-All'avvio della fase di validazione il progetto cerca gli `enum` del parametro `shapeModel` nell'OpenAPI del validator. La priorità è:
+Per indicare il percorso del file:
 
-1. file indicato da `MQA_SHACL_OPENAPI`;
-2. file `openapi-shacl.yaml` / `openapi-shacl.yml` nel progetto o nei percorsi standard del checkout locale del validator;
-3. URL indicato da `MQA_SHACL_OPENAPI_URL`;
-4. OpenAPI esposto dallo stesso validator (`/openapi-shacl.yaml` o `/openapi-shacl.yml`, con alcuni percorsi alternativi);
-5. solo se tutti i precedenti tentativi falliscono, lista `BUILTIN_PROFILES` incorporata.
-
-Se un file OpenAPI **esplicitamente configurato** esiste ma è sintatticamente errato o non contiene alcun `shapeModel` valido, il programma
-termina con errore invece di sostituirlo silenziosamente con il fallback.
-
-Il parametro `customized` non viene considerato un profilo della matrice sperimentale perché richiede una configurazione aggiuntiva dei suoi
-aspetti.
-
-I profili il cui identificativo contiene `de` (ricerca case-insensitive) vengono esclusi dalla matrice: non saranno validati né attesi come
-parte del completamento del dataset. Eventuali righe storiche già presenti nel database rimangono conservate come traccia delle esecuzioni
-precedenti.
-
-È possibile vedere nei log la sorgente usata, ad esempio:
-
-```text
-Profile source: file:/.../openapi-shacl.yaml (24 profiles)
+```bash
+export MQA_SHACL_OPENAPI=/percorso/assoluto/validating-shacl/src/main/resources/webroot/openapi-shacl.yaml
 ```
 
-oppure:
+Se la variabile non è impostata, il programma cerca `openapi-shacl.yaml` nella directory di lavoro corrente. Se il file manca, non è leggibile, contiene YAML non valido o non presenta profili `shapeModel` validi, il caricamento termina con errore: non viene usata una lista alternativa.
 
-```text
-Profile source: url:http://localhost:8080/openapi-shacl.yaml (24 profiles)
-```
+Dal parametro `shapeModel` dell'OpenAPI vengono estratti i valori `enum`; sono quindi applicati questi filtri, senza distinzione tra maiuscole e minuscole:
 
-Solo in caso di assenza dell'OpenAPI:
+- esclusione degli identificativi contenenti `de`, per escludere i profili tedeschi;
+- esclusione degli identificativi contenenti `orig`, per escludere le varianti storiche richieste;
+- esclusione del valore `customized`, che richiede una configurazione aggiuntiva;
+- rimozione dei duplicati, preservando l'ordine originale del file.
 
-```text
-Profile source: builtin [BUILT-IN FALLBACK]
-```
+I profili esclusi non vengono pianificati per la validazione e non sono attesi nel completamento dei dataset. Le eventuali righe storiche già presenti nel database rimangono conservate.
+
+Nei log sono riportati il percorso del file sorgente, il numero dei profili dopo il filtraggio e l'ordine delle catene di validazione. Per riprodurre un esperimento occorre quindi conservare anche la versione del file `openapi-shacl.yaml` utilizzato.
 
 ## Validazione intelligente per livelli
 
@@ -380,12 +363,6 @@ http://localhost:8080/shacl/validation/report
 export MQA_SHACL_OPENAPI=/percorso/assoluto/openapi-shacl.yaml
 ```
 
-oppure l'URL dell'OpenAPI:
-
-```bash
-export MQA_SHACL_OPENAPI_URL=http://localhost:8080/openapi-shacl.yaml
-```
-
 ### Verifica manuale di un profilo
 
 Per isolare completamente eventuali problemi del progetto dal validator, la stessa richiesta costruita dal client può essere eseguita
@@ -453,3 +430,20 @@ di data.europa.eu.
 La discovery utilizza l'operazione catalog-specifica di Hub Search per ottenere l'insieme degli ID. La fase `fetch` recupera successivamente
 il RDF di ciascun dataset dall'Hub Repo, mentre `run` sottopone lo stesso RDF al validator SHACL locale per i `shapeModel` effettivamente
 dichiarati dal suo OpenAPI.
+
+
+## Analisi statistica del database
+
+Il modulo `src.analysis` legge `analysis.db` in sola lettura e produce riepiloghi CSV e grafici PNG, senza modificare il database. Richiede `matplotlib` (incluso tra le dipendenze del progetto).
+
+```bash
+python -m src.analysis
+```
+
+Percorsi personalizzati:
+
+```bash
+python -m src.analysis --db /percorso/analysis.db --out risultati-analisi
+```
+
+Output: `profile_summary.csv` e `profile_conformance.png` (conformità per profilo), `version_transitions.csv` e `version_transitions.png` (transizioni tra versioni DCAT-AP consecutive), `shacl_issues.csv` (frequenza delle issue per shape, componente e percorso). La conformità è calcolata solo sulle validazioni completate con HTTP 200 e `conforms` valorizzato; righe `error` e `skipped` non entrano nel denominatore. Il confronto tra versioni usa esclusivamente profili base `dcatap<versione>`, escludendo i profili `level1/2/3`.
