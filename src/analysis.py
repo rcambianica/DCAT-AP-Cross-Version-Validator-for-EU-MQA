@@ -1,16 +1,25 @@
-"""Read-only analysis and static visualisations of the validator analysis database.
+"""Read-only descriptive analysis of DCAT-AP SHACL validation results.
 
-The module reads analysis.db, writes CSV summaries and four publication-oriented
-PNG charts. It does not modify the source database.
+Generates five charts and CSV tables from analysis.db. The source database is
+opened read-only. SHACL property paths are classified from RDF term types and,
+when possible, resolved from the original validation report.
 """
 from __future__ import annotations
 
 import argparse
 import csv
+import gzip
+import json
 import re
 import sqlite3
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
+
+SH = "http://www.w3.org/ns/shacl#"
+RDF_FIRST = "http://www.w3.org/1999/02/22-rdf-syntax-ns#first"
+RDF_REST = "http://www.w3.org/1999/02/22-rdf-syntax-ns#rest"
+RDF_NIL = "http://www.w3.org/1999/02/22-rdf-syntax-ns#nil"
 
 
 def connect_readonly(db_path: Path) -> sqlite3.Connection:
@@ -21,38 +30,33 @@ def connect_readonly(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
-def profile_version(profile: str) -> tuple[str, str] | None:
-    """Return (normalized version, profile id) for base DCAT-AP profile IDs."""
-    match = re.fullmatch(r"dcatap(\d+)", (profile or "").casefold())
+def parse_shape_model(profile: str) -> tuple[str, str] | None:
+    """Return (version, level); base profiles use level='base'."""
+    match = re.fullmatch(r"dcatap(\d+)(?:level([123]))?", (profile or "").casefold())
     if not match:
         return None
-    digits = match.group(1)
+    digits, level_number = match.groups()
     if len(digits) == 1:
         version = digits
     elif len(digits) == 2:
         version = f"{digits[0]}.{digits[1]}"
     else:
-        # The profile identifier concatenates major, minor and patch digits:
-        # dcatap121 -> 1.2.1; dcatap300 -> 3.0.0; dcatap1100 -> 1.1.0.
         version = f"{digits[0]}.{digits[1]}.{int(digits[2:])}"
-    return version, profile
-
-
-def _write_csv(path: Path, headers: list[str], rows: list[dict[str, Any]]) -> None:
-    with path.open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=headers)
-        writer.writeheader()
-        writer.writerows(rows)
+    return version, f"level{level_number}" if level_number else "base"
 
 
 def _version_key(version: str) -> tuple[int, ...]:
     return tuple(int(part) for part in version.split("."))
 
 
-def _short_property(value: str | None) -> str:
-    """Shorten common RDF namespaces for readable chart labels."""
-    if not value:
-        return "(percorso non specificato)"
+def _write_csv(path: Path, headers: list[str], rows: list[dict[str, Any]]) -> None:
+    with path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=headers, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _short_iri(value: str) -> str:
     namespaces = (
         ("http://www.w3.org/ns/dcat#", "dcat:"),
         ("http://www.w3.org/ns/adms#", "adms:"),
@@ -61,351 +65,400 @@ def _short_property(value: str | None) -> str:
         ("http://www.w3.org/2004/02/skos/core#", "skos:"),
         ("http://www.w3.org/ns/dqv#", "dqv:"),
         ("http://data.europa.eu/r5r/", "r5r:"),
+        ("http://www.w3.org/2002/07/owl#", "owl:"),
     )
+    if value == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type":
+        return "rdf:type"
     for namespace, prefix in namespaces:
         if value.startswith(namespace):
             return prefix + value[len(namespace):]
     return value
 
 
-def _save_bar_chart(plt, output_path: Path, title: str, xlabel: str, ylabel: str) -> None:
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=220, bbox_inches="tight")
-    plt.close()
+def _rdf_path_expression(graph, node, depth: int = 0, seen: set | None = None) -> str:
+    """Render a SHACL path expression without exposing generated blank-node IDs."""
+    from rdflib import BNode, URIRef
+
+    if depth > 12:
+        return "<percorso complesso: profondità massima>"
+    seen = set() if seen is None else seen
+    if node in seen:
+        return "<percorso ciclico>"
+    if isinstance(node, URIRef):
+        return _short_iri(str(node))
+    if not isinstance(node, BNode):
+        return str(node)
+    seen = seen | {node}
+
+    def one(predicate: str):
+        values = list(graph.objects(node, URIRef(predicate)))
+        return values[0] if len(values) == 1 else None
+
+    inverse = one(SH + "inversePath")
+    if inverse is not None:
+        return f"inverse({_rdf_path_expression(graph, inverse, depth + 1, seen)})"
+    for predicate, operator in (("zeroOrMorePath", "*"), ("oneOrMorePath", "+"), ("zeroOrOnePath", "?")):
+        child = one(SH + predicate)
+        if child is not None:
+            return f"({_rdf_path_expression(graph, child, depth + 1, seen)}){operator}"
+    alternative = one(SH + "alternativePath")
+    if alternative is not None:
+        members = _rdf_list(graph, alternative)
+        if members is not None:
+            return "(" + " | ".join(_rdf_path_expression(graph, item, depth + 1, seen) for item in members) + ")"
+    # A blank-node SHACL sequence path is encoded as an RDF list itself.
+    members = _rdf_list(graph, node)
+    if members is not None:
+        return "/".join(_rdf_path_expression(graph, item, depth + 1, seen) for item in members)
+    return "<percorso SHACL complesso non risolto>"
+
+
+def _rdf_list(graph, head):
+    from rdflib import BNode, URIRef
+    items, current, seen = [], head, set()
+    nil = URIRef(RDF_NIL)
+    while current != nil:
+        if current in seen or len(items) > 100:
+            return None
+        seen.add(current)
+        first = list(graph.objects(current, URIRef(RDF_FIRST)))
+        rest = list(graph.objects(current, URIRef(RDF_REST)))
+        if len(first) != 1 or len(rest) != 1:
+            return None
+        items.append(first[0])
+        current = rest[0]
+    return items
+
+
+def _resolve_path(validation: sqlite3.Row, result_path: str | None,
+                  properties_json: str | None, graph_cache: dict[int, Any]) -> tuple[str, str]:
+    """Return (path category, readable path)."""
+    if not result_path:
+        return "missing", "(resultPath assente)"
+    try:
+        props = json.loads(properties_json or "{}")
+        terms = props.get(SH + "resultPath", [])
+        term = terms[0] if terms else {}
+        term_type = term.get("term_type")
+    except (TypeError, ValueError, AttributeError):
+        term_type = None
+
+    if term_type == "uri" or result_path.startswith(("http://", "https://", "urn:")):
+        return "simple_iri", _short_iri(result_path)
+    if term_type != "bnode":
+        return "unclassified", "<percorso non classificabile>"
+
+    validation_id = int(validation["id"] if "id" in validation.keys() else validation["validation_id"])
+    graph = graph_cache.get(validation_id)
+    if graph is None:
+        graph_cache[validation_id] = False
+        body = validation["report_body_gzip"]
+        if body:
+            try:
+                from rdflib import Graph, BNode
+                graph = Graph()
+                graph.parse(data=gzip.decompress(body), format=validation["report_format"] or "turtle")
+                graph_cache[validation_id] = graph
+            except Exception:
+                graph = None
+    if graph:
+        try:
+            from rdflib import URIRef
+            from rdflib.namespace import RDF
+            # RDFLib assigns fresh blank-node identifiers when reparsing Turtle.
+            # Therefore the BNode label stored in properties_json cannot be
+            # looked up directly. Re-identify the ValidationResult by its stable
+            # semantic fields, then follow its sh:resultPath object.
+            candidates = list(graph.subjects(RDF.type, URIRef(SH + "ValidationResult")))
+            for candidate in candidates:
+                focus_values = list(graph.objects(candidate, URIRef(SH + "focusNode")))
+                component_values = list(graph.objects(candidate, URIRef(SH + "sourceConstraintComponent")))
+                severity_values = list(graph.objects(candidate, URIRef(SH + "resultSeverity")))
+                message_values = list(graph.objects(candidate, URIRef(SH + "resultMessage")))
+                if validation["focus_node"] and not any(str(x) == validation["focus_node"] for x in focus_values):
+                    continue
+                if validation["source_constraint_component"] and not any(str(x).rsplit("#", 1)[-1] == validation["source_constraint_component"] for x in component_values):
+                    continue
+                if validation["severity"] and not any(str(x).rsplit("#", 1)[-1] == validation["severity"] for x in severity_values):
+                    continue
+                if validation["message"]:
+                    expected_messages = [part.strip() for part in validation["message"].split(" | ") if part.strip()]
+                    if not any(str(x) in expected_messages for x in message_values):
+                        continue
+                paths = list(graph.objects(candidate, URIRef(SH + "resultPath")))
+                for path_node in paths:
+                    expression = _rdf_path_expression(graph, path_node)
+                    if not expression.startswith("<percorso SHACL complesso non risolto>"):
+                        return "complex_resolved", expression
+        except Exception:
+            pass
+    return "complex_unresolved", "<percorso SHACL complesso non risolto>"
 
 
 def analyze_database(db_path: Path, output_dir: Path) -> dict[str, Any]:
-    """Generate CSV summaries and four static PNG charts from successful validations."""
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import numpy as np
     except ImportError as exc:
-        raise RuntimeError(
-            "Per generare i grafici installare matplotlib e numpy: "
-            "pip install matplotlib numpy"
-        ) from exc
+        raise RuntimeError("Installare matplotlib e numpy: pip install matplotlib numpy") from exc
 
     output_dir.mkdir(parents=True, exist_ok=True)
-
     with connect_readonly(db_path) as conn:
         dataset_count = conn.execute("SELECT COUNT(*) FROM datasets").fetchone()[0]
-        fetch_counts = conn.execute(
-            "SELECT fetch_status, COUNT(*) AS n FROM datasets "
-            "GROUP BY fetch_status ORDER BY fetch_status"
-        ).fetchall()
-
-        # All summaries use the same population of successfully completed validations.
-        validation_rows = conn.execute("""
-            SELECT v.id, v.dataset_id, v.shape_model, v.conforms,
-                   v.violations, v.warnings, v.infos
+        fetch_counts = conn.execute("SELECT fetch_status, COUNT(*) n FROM datasets GROUP BY fetch_status").fetchall()
+        validations = conn.execute("""
+            SELECT v.id, v.dataset_id, v.validator_url, v.shape_model, v.conforms,
+                   v.results, v.violations, v.warnings, v.infos,
+                   v.report_body_gzip, v.report_format
             FROM validations v
-            JOIN datasets d ON d.dataset_id = v.dataset_id
-            WHERE v.execution_status = 'validated'
-              AND v.http_status = 200
-              AND v.conforms IS NOT NULL
-              AND (v.error IS NULL OR TRIM(v.error) = '')
+            WHERE v.execution_status='validated' AND v.http_status=200
+              AND v.conforms IS NOT NULL AND (v.error IS NULL OR TRIM(v.error)='')
             ORDER BY v.shape_model, v.dataset_id
         """).fetchall()
 
-        profile_stats: dict[str, dict[str, Any]] = {}
-        by_dataset_version: dict[tuple[str, str], int] = {}
-        for row in validation_rows:
-            profile = row["shape_model"] or "(shape model non specificato)"
-            stat = profile_stats.setdefault(profile, {
-                "profile": profile, "validated": 0, "conforming": 0,
-                "non_conforming": 0, "violations": 0, "warnings": 0, "infos": 0,
-            })
-            stat["validated"] += 1
-            stat["conforming"] += int(row["conforms"] == 1)
-            stat["non_conforming"] += int(row["conforms"] == 0)
-            stat["violations"] += row["violations"] or 0
-            stat["warnings"] += row["warnings"] or 0
-            stat["infos"] += row["infos"] or 0
-
-            parsed = profile_version(profile)
-            if parsed:
-                version, _ = parsed
-                by_dataset_version[(row["dataset_id"], version)] = int(row["conforms"])
-
-        profile_rows: list[dict[str, Any]] = []
-        for stat in sorted(profile_stats.values(), key=lambda item: item["profile"]):
-            stat["conformance_pct"] = round(
-                100 * stat["conforming"] / stat["validated"], 2
-            ) if stat["validated"] else 0
-            stat["violation_rate_per_100"] = round(
-                100 * stat["violations"] / stat["validated"], 2
-            ) if stat["validated"] else 0
-            stat["warning_rate_per_100"] = round(
-                100 * stat["warnings"] / stat["validated"], 2
-            ) if stat["validated"] else 0
-            profile_rows.append(stat)
-
-        # Category key: RDF result path + SHACL constraint component.
-        # Message/source_shape are deliberately not grouping keys because they
-        # can contain dataset-specific RDF terms or generated blank-node IDs.
-        issue_rows = conn.execute("""
-            SELECT v.shape_model AS profile,
-                   vr.severity,
-                   vr.result_path,
-                   vr.source_constraint_component AS constraint_component,
-                   COUNT(*) AS occurrences,
-                   COUNT(DISTINCT vr.validation_id) AS affected_validations,
-                   COUNT(DISTINCT v.dataset_id) AS affected_datasets,
-                   MIN(vr.message) AS example_message
-            FROM validation_results vr
-            JOIN validations v ON v.id = vr.validation_id
-            WHERE v.execution_status = 'validated'
-              AND v.http_status = 200
-              AND v.conforms IS NOT NULL
-              AND (v.error IS NULL OR TRIM(v.error) = '')
-              AND vr.severity IN ('Violation', 'Warning')
-            GROUP BY v.shape_model, vr.severity, vr.result_path,
-                     vr.source_constraint_component
-            ORDER BY v.shape_model, vr.severity, occurrences DESC
+        # Individual SHACL results. Keep all fields needed for path classification.
+        result_rows = conn.execute("""
+            SELECT v.id AS validation_id, v.dataset_id, v.shape_model,
+                   v.report_body_gzip, v.report_format,
+                   vr.severity, vr.result_path, vr.properties_json,
+                   vr.source_constraint_component, vr.result_node, vr.focus_node,
+                   vr.source_shape, vr.message
+            FROM validation_results vr JOIN validations v ON v.id=vr.validation_id
+            WHERE v.execution_status='validated' AND v.http_status=200
+              AND v.conforms IS NOT NULL AND (v.error IS NULL OR TRIM(v.error)='')
+              AND vr.severity IN ('Violation','Warning','Info')
         """).fetchall()
 
-        property_rows = conn.execute("""
-            SELECT vr.result_path,
-                   COUNT(*) AS occurrences,
-                   COUNT(DISTINCT vr.validation_id) AS affected_validations,
-                   COUNT(DISTINCT v.dataset_id) AS affected_datasets
-            FROM validation_results vr
-            JOIN validations v ON v.id = vr.validation_id
-            WHERE v.execution_status = 'validated'
-              AND v.http_status = 200
-              AND v.conforms IS NOT NULL
-              AND (v.error IS NULL OR TRIM(v.error) = '')
-              AND vr.severity = 'Violation'
-            GROUP BY vr.result_path
-            ORDER BY occurrences DESC
-        """).fetchall()
+    # Summary per profile, including the three mutually exclusive outcome groups.
+    summary = defaultdict(lambda: Counter({"validated": 0, "conforming": 0, "violations": 0, "warnings": 0, "infos": 0, "with_violations": 0, "without_violations_with_findings": 0, "no_findings": 0}))
+    per_validation = []
+    for row in validations:
+        profile = row["shape_model"] or "(shape model non specificato)"
+        stat = summary[profile]
+        stat["validated"] += 1
+        stat["conforming"] += int(row["conforms"] == 1)
+        stat["violations"] += int(row["violations"] or 0)
+        stat["warnings"] += int(row["warnings"] or 0)
+        stat["infos"] += int(row["infos"] or 0)
+        v, w, i = int(row["violations"] or 0), int(row["warnings"] or 0), int(row["infos"] or 0)
+        stat["with_violations"] += int(v > 0)
+        stat["without_violations_with_findings"] += int(v == 0 and (w + i) > 0)
+        stat["no_findings"] += int(v == 0 and w == 0 and i == 0)
+        per_validation.append({"validation_id": row["id"], "dataset_id": row["dataset_id"],
+            "shape_model": profile, "violations": v, "warnings": w, "infos": i,
+            "results": int(row["results"] or 0), "conforms": row["conforms"]})
 
-        component_rows = conn.execute("""
-            SELECT vr.source_constraint_component AS constraint_component,
-                   vr.severity,
-                   COUNT(*) AS occurrences
-            FROM validation_results vr
-            JOIN validations v ON v.id = vr.validation_id
-            WHERE v.execution_status = 'validated'
-              AND v.http_status = 200
-              AND v.conforms IS NOT NULL
-              AND (v.error IS NULL OR TRIM(v.error) = '')
-              AND vr.severity IN ('Violation', 'Warning')
-            GROUP BY vr.source_constraint_component, vr.severity
-            ORDER BY occurrences DESC
-        """).fetchall()
+    profile_rows = []
+    for profile in sorted(summary):
+        s = summary[profile]
+        n = s["validated"]
+        profile_rows.append({"shape_model": profile, **s,
+            "conformance_pct": round(100*s["conforming"]/n, 2) if n else 0,
+            "no_findings_pct": round(100*s["no_findings"]/n, 2) if n else 0,
+            "findings_without_violations_pct": round(100*s["without_violations_with_findings"]/n, 2) if n else 0,
+            "with_violations_pct": round(100*s["with_violations"]/n, 2) if n else 0})
 
-        # Count result rows by profile and severity; rates are normalized by
-        # the number of successful validations for that profile.
-        profile_issue_rows = conn.execute("""
-            SELECT v.shape_model AS profile, vr.severity, COUNT(*) AS occurrences
-            FROM validation_results vr
-            JOIN validations v ON v.id = vr.validation_id
-            WHERE v.execution_status = 'validated'
-              AND v.http_status = 200
-              AND v.conforms IS NOT NULL
-              AND (v.error IS NULL OR TRIM(v.error) = '')
-              AND vr.severity IN ('Violation', 'Warning')
-            GROUP BY v.shape_model, vr.severity
-        """).fetchall()
-
-    issue_columns = [
-        "profile", "severity", "result_path", "constraint_component",
-        "occurrences", "affected_validations", "affected_datasets", "example_message",
-    ]
-    issue_records = [dict(zip(issue_columns, row)) for row in issue_rows]
-    property_records = [dict(row) for row in property_rows]
-    component_records = [dict(row) for row in component_rows]
-
-    _write_csv(
-        output_dir / "profile_summary.csv",
-        ["profile", "validated", "conforming", "non_conforming", "conformance_pct",
-         "violations", "warnings", "infos", "violation_rate_per_100", "warning_rate_per_100"],
-        profile_rows,
-    )
-    _write_csv(output_dir / "shacl_issues.csv", issue_columns, issue_records)
-    _write_csv(
-        output_dir / "violations_by_property.csv",
-        ["result_path", "occurrences", "affected_validations", "affected_datasets"],
-        property_records,
-    )
-    _write_csv(
-        output_dir / "shacl_components.csv",
-        ["constraint_component", "severity", "occurrences"],
-        component_records,
-    )
-
-    # 1. Violations by RDF property: top 15 properties, all shape models combined.
-    chart_property_counts: dict[str, int] = {}
-    for row in property_records:
-        raw_path = row["result_path"]
-        if raw_path and str(raw_path).startswith(("http://", "https://", "urn:")):
-            label = _short_property(str(raw_path))
-        else:
-            # SHACL property paths may be represented by blank nodes. Their
-            # generated identifiers are not meaningful categories for a chart.
-            label = "Percorso SHACL complesso (blank node/non-IRI)"
-        chart_property_counts[label] = chart_property_counts.get(label, 0) + int(row["occurrences"])
-    top_properties = sorted(
-        ({"label": label, "occurrences": count} for label, count in chart_property_counts.items()),
-        key=lambda row: row["occurrences"], reverse=True
-    )[:15]
-    if top_properties:
-        labels = [row["label"] for row in reversed(top_properties)]
-        values = [int(row["occurrences"]) for row in reversed(top_properties)]
-        fig, ax = plt.subplots(figsize=(11, max(5.5, 0.38 * len(labels))))
-        ax.barh(labels, values)
-        ax.set_xlabel("Numero di violazioni")
-        ax.set_ylabel("Proprietà RDF (result_path)")
-        ax.set_title("Distribuzione delle violazioni per proprietà RDF")
-        ax.grid(axis="x", linestyle=":", alpha=0.45)
-        ax.set_axisbelow(True)
-        _save_bar_chart(plt, output_dir / "violations_by_rdf_property.png", "", "", "")
-
-    # 2. SHACL constraint components, split by severity.
-    component_names = sorted({
-        str(row["constraint_component"] or "(non specificato)")
-        for row in component_records
-    })
-    if component_names:
-        severities = ("Violation", "Warning")
-        values_by_severity = {
-            severity: {
-                str(row["constraint_component"] or "(non specificato)"): int(row["occurrences"])
-                for row in component_records if row["severity"] == severity
-            }
-            for severity in severities
-        }
-        totals = {
-            name: sum(values_by_severity[severity].get(name, 0) for severity in severities)
-            for name in component_names
-        }
-        component_names.sort(key=lambda name: totals[name])
-        y = np.arange(len(component_names))
-        fig, ax = plt.subplots(figsize=(11, max(5.5, 0.42 * len(component_names))))
-        left = np.zeros(len(component_names))
-        for severity in severities:
-            vals = np.array([values_by_severity[severity].get(name, 0) for name in component_names])
-            ax.barh(y, vals, left=left, label=severity)
-            left += vals
-        ax.set_yticks(y, component_names)
-        ax.set_xlabel("Numero di risultati SHACL")
-        ax.set_ylabel("Constraint component")
-        ax.set_title("Distribuzione dei risultati per componente SHACL")
-        ax.legend(title="Severità")
-        ax.grid(axis="x", linestyle=":", alpha=0.45)
-        ax.set_axisbelow(True)
-        _save_bar_chart(plt, output_dir / "shacl_component_distribution.png", "", "", "")
-
-    # 3. Shape-model comparison: result occurrences per 100 successful validations.
-    if profile_rows:
-        counts = {
-            (row["profile"], row["severity"]): int(row["occurrences"])
-            for row in profile_issue_rows
-        }
-        labels = [row["profile"] for row in profile_rows]
-        denominator = {row["profile"]: int(row["validated"]) for row in profile_rows}
-        violation_rates = [
-            100 * counts.get((profile, "Violation"), 0) / denominator[profile]
-            if denominator[profile] else 0 for profile in labels
-        ]
-        warning_rates = [
-            100 * counts.get((profile, "Warning"), 0) / denominator[profile]
-            if denominator[profile] else 0 for profile in labels
-        ]
-        x = np.arange(len(labels))
-        width = 0.38
-        fig, ax = plt.subplots(figsize=(max(11, len(labels) * 0.7), 6.5))
-        ax.bar(x - width / 2, violation_rates, width, label="Violation")
-        ax.bar(x + width / 2, warning_rates, width, label="Warning")
-        ax.set_xticks(x, labels, rotation=65, ha="right")
-        ax.set_ylabel("Risultati ogni 100 validazioni")
-        ax.set_xlabel("Shape model")
-        ax.set_title("Confronto tra shape model")
-        ax.legend(title="Severità")
-        ax.grid(axis="y", linestyle=":", alpha=0.45)
-        ax.set_axisbelow(True)
-        _save_bar_chart(plt, output_dir / "shape_model_comparison.png", "", "", "")
-
-    # 4. DCAT-AP version comparison. Compare base profiles only (e.g. dcatap300),
-    # avoiding the aggregation of different SHACL conformance levels. Since
-    # conformance can be uniformly false in the observed sample, compare the
-    # normalized number of Violation/Warning result rows per 100 validations.
-    version_profile_rows: dict[str, dict[str, Any]] = {}
-    for row in profile_rows:
-        parsed = profile_version(row["profile"])
+    # Paired comparisons: same dataset, validator endpoint and same SHACL level.
+    by_pair_key = {}
+    for row in validations:
+        parsed = parse_shape_model(row["shape_model"] or "")
         if not parsed:
             continue
-        version, _ = parsed
-        target = version_profile_rows.setdefault(version, {
-            "version": version, "validated": 0, "violations": 0, "warnings": 0,
-        })
-        target["validated"] += int(row["validated"])
-        target["violations"] += int(row["violations"])
-        target["warnings"] += int(row["warnings"])
+        version, level = parsed
+        by_pair_key[(row["dataset_id"], row["validator_url"], level, version)] = row
+    versions = sorted({key[3] for key in by_pair_key}, key=_version_key)
+    pairs = []
+    for level in sorted({key[2] for key in by_pair_key}):
+        for old, new in zip(versions, versions[1:]):
+            for (dataset_id, endpoint, lev, version), a in list(by_pair_key.items()):
+                if lev != level or version != old:
+                    continue
+                b = by_pair_key.get((dataset_id, endpoint, level, new))
+                if b is None:
+                    continue
+                pairs.append({"dataset_id": dataset_id, "level": level,
+                    "from_version": old, "to_version": new,
+                    "from_profile": a["shape_model"], "to_profile": b["shape_model"],
+                    "delta_violations": int(b["violations"] or 0)-int(a["violations"] or 0),
+                    "delta_warnings": int(b["warnings"] or 0)-int(a["warnings"] or 0)})
+    transition_summary = []
+    grouped = {}
+    for p in pairs:
+        key = (p["level"], p["from_version"], p["to_version"])
+        g = grouped.setdefault(key, {"paired_datasets": 0, "violations_increased": 0,
+            "violations_decreased": 0, "violations_unchanged": 0,
+            "warnings_increased": 0, "warnings_decreased": 0, "warnings_unchanged": 0})
+        g["paired_datasets"] += 1
+        for field, delta in (("violations", p["delta_violations"]), ("warnings", p["delta_warnings"])):
+            g[f"{field}_{'increased' if delta > 0 else 'decreased' if delta < 0 else 'unchanged'}"] += 1
+    for (level, old, new), values in sorted(grouped.items()):
+        transition_summary.append({"level": level, "from_version": old, "to_version": new, **values})
 
-    version_summary = []
-    for version in sorted(version_profile_rows, key=_version_key):
-        row = version_profile_rows[version]
-        n = row["validated"]
-        version_summary.append({
-            "version": version,
-            "validated": n,
-            "violation_occurrences": row["violations"],
-            "warning_occurrences": row["warnings"],
-            "violations_per_100_validations": round(100 * row["violations"] / n, 2) if n else 0,
-            "warnings_per_100_validations": round(100 * row["warnings"] / n, 2) if n else 0,
-        })
-    _write_csv(
-        output_dir / "dcatap_version_comparison.csv",
-        ["version", "validated", "violation_occurrences", "warning_occurrences",
-         "violations_per_100_validations", "warnings_per_100_validations"],
-        version_summary,
-    )
-    if version_summary:
-        labels = [row["version"] for row in version_summary]
-        violation_rates = [row["violations_per_100_validations"] for row in version_summary]
-        warning_rates = [row["warnings_per_100_validations"] for row in version_summary]
-        x = np.arange(len(labels))
-        width = 0.38
-        fig, ax = plt.subplots(figsize=(max(9, len(labels) * 0.85), 6))
-        ax.bar(x - width / 2, violation_rates, width, label="Violation")
-        ax.bar(x + width / 2, warning_rates, width, label="Warning")
-        ax.set_xticks(x, labels)
-        ax.set_ylabel("Risultati ogni 100 validazioni")
-        ax.set_xlabel("Versione DCAT-AP (shape model base)")
-        ax.set_title("Confronto dei risultati SHACL tra versioni DCAT-AP")
-        ax.legend(title="Severità")
-        ax.grid(axis="y", linestyle=":", alpha=0.45)
-        ax.set_axisbelow(True)
-        _save_bar_chart(plt, output_dir / "dcatap_version_comparison.png", "", "", "")
+    # Classify property paths; never aggregate generated blank-node labels as properties.
+    graph_cache: dict[int, Any] = {}
+    path_groups = defaultdict(lambda: {"occurrences": 0, "datasets": set()})
+    component_groups = defaultdict(lambda: {"occurrences": 0, "datasets": set()})
+    for row in result_rows:
+        path_type, path_label = _resolve_path(row, row["result_path"], row["properties_json"], graph_cache)
+        severity = row["severity"]
+        path_groups[(row["shape_model"], severity, path_type, path_label)]["occurrences"] += 1
+        path_groups[(row["shape_model"], severity, path_type, path_label)]["datasets"].add(row["dataset_id"])
+        component = row["source_constraint_component"] or "(componente non specificata)"
+        component_groups[(row["shape_model"], severity, component)]["occurrences"] += 1
+        component_groups[(row["shape_model"], severity, component)]["datasets"].add(row["dataset_id"])
 
-    return {
-        "datasets_in_inventory": dataset_count,
-        "fetch_status": {row[0]: row[1] for row in fetch_counts},
-        "successful_validation_rows": len(validation_rows),
-        "profiles": len(profile_rows),
-        "issue_categories": len(issue_records),
-        "charts_generated": sum([
-            bool(top_properties), bool(component_names), bool(profile_rows), bool(version_summary)
-        ]),
-        "output_dir": str(output_dir.resolve()),
-    }
+    path_records = []
+    for (profile, severity, path_type, label), values in sorted(path_groups.items()):
+        path_records.append({"shape_model": profile, "severity": severity, "path_type": path_type,
+            "path": label, "occurrences": values["occurrences"],
+            "affected_datasets": len(values["datasets"])})
+    component_records = []
+    for (profile, severity, component), values in sorted(component_groups.items()):
+        denom = next((r["validated"] for r in profile_rows if r["shape_model"] == profile), 0)
+        component_records.append({"shape_model": profile, "severity": severity,
+            "constraint_component": component, "occurrences": values["occurrences"],
+            "affected_datasets": len(values["datasets"]), "validated_datasets": denom,
+            "affected_pct": round(100*len(values["datasets"])/denom, 2) if denom else 0})
+
+    # Global property ranking is restricted to direct IRI paths. Complex paths
+    # remain separately visible in the CSV with their canonical expression.
+    property_aggregate = Counter()
+    property_datasets = {}
+    for r in path_records:
+        if r["path_type"] != "simple_iri" or r["severity"] != "Violation":
+            continue
+        property_aggregate[r["path"]] += r["occurrences"]
+        property_datasets.setdefault(r["path"], set()).update(
+            # Affected dataset IDs are accumulated below from raw result rows.
+            []
+        )
+    property_dataset_sets = {}
+    for row in result_rows:
+        if row["severity"] != "Violation":
+            continue
+        ptype, label = _resolve_path(row, row["result_path"], row["properties_json"], graph_cache)
+        if ptype == "simple_iri":
+            property_dataset_sets.setdefault(label, set()).add(row["dataset_id"])
+    property_records = [{"property": name, "occurrences": count,
+        "affected_datasets": len(property_dataset_sets.get(name, set()))}
+        for name, count in property_aggregate.most_common()]
+
+    _write_csv(output_dir/"profile_summary.csv", list(profile_rows[0].keys()) if profile_rows else
+        ["shape_model","validated","conforming","with_violations","without_violations_with_findings","no_findings"], profile_rows)
+    _write_csv(output_dir/"validation_distribution.csv",
+        ["validation_id","dataset_id","shape_model","violations","warnings","infos","results","conforms"], per_validation)
+    _write_csv(output_dir/"paired_version_deltas.csv",
+        ["dataset_id","level","from_version","to_version","from_profile","to_profile","delta_violations","delta_warnings"], pairs)
+    _write_csv(output_dir/"paired_version_summary.csv",
+        ["level","from_version","to_version","paired_datasets","violations_increased","violations_decreased","violations_unchanged","warnings_increased","warnings_decreased","warnings_unchanged"], transition_summary)
+    _write_csv(output_dir/"shacl_components.csv",
+        ["shape_model","severity","constraint_component","occurrences","affected_datasets","validated_datasets","affected_pct"], component_records)
+    _write_csv(output_dir/"shacl_paths.csv",
+        ["shape_model","severity","path_type","path","occurrences","affected_datasets"], path_records)
+    _write_csv(output_dir/"violations_by_rdf_property.csv",
+        ["property","occurrences","affected_datasets"], property_records)
+
+    # Chart 1: mutually exclusive validation outcome distribution.
+    if profile_rows:
+        labels = [r["shape_model"] for r in profile_rows]
+        fig, ax = plt.subplots(figsize=(max(11, len(labels)*0.68), 7))
+        bottom = np.zeros(len(labels))
+        for key, label in (("no_findings_pct", "Nessun risultato"),
+                           ("findings_without_violations_pct", "Risultati senza violation"),
+                           ("with_violations_pct", "Almeno una violation")):
+            vals = np.array([r[key] for r in profile_rows])
+            ax.bar(labels, vals, bottom=bottom, label=label)
+            bottom += vals
+        ax.set_ylim(0, 100); ax.set_ylabel("Validazioni (%)")
+        ax.set_xlabel("Shape model"); ax.set_title("Distribuzione degli esiti per shape model")
+        ax.tick_params(axis="x", rotation=65); ax.legend()
+        ax.grid(axis="y", linestyle=":", alpha=.4); ax.set_axisbelow(True)
+        fig.tight_layout(); fig.savefig(output_dir/"validation_outcomes.png", dpi=220, bbox_inches="tight"); plt.close(fig)
+
+    # Chart 2: two boxplot panels, raw per-dataset distributions.
+    if per_validation:
+        labels = [r["shape_model"] for r in profile_rows]
+        fig, axes = plt.subplots(2, 1, figsize=(max(11, len(labels)*.7), 10), sharex=True)
+        for ax, field, title in ((axes[0], "violations", "Violation per validazione"),
+                                 (axes[1], "warnings", "Warning per validazione")):
+            data = [[r[field] for r in per_validation if r["shape_model"] == label] for label in labels]
+            ax.boxplot(data, tick_labels=labels, showfliers=True)
+            ax.set_ylabel("Numero di risultati"); ax.set_title(title)
+            ax.grid(axis="y", linestyle=":", alpha=.4); ax.set_axisbelow(True)
+        axes[1].tick_params(axis="x", rotation=65)
+        fig.suptitle("Distribuzione dei risultati SHACL tra dataset")
+        fig.tight_layout(); fig.savefig(output_dir/"shacl_result_distributions.png", dpi=220, bbox_inches="tight"); plt.close(fig)
+
+    # Chart 3: paired deltas, grouped by the same validation level.
+    if transition_summary:
+        labels = [f"{r['level']}\n{r['from_version']} → {r['to_version']}" for r in transition_summary]
+        x = np.arange(len(labels)); width = .36
+        fig, axes = plt.subplots(2, 1, figsize=(max(10, len(labels)*.85), 9), sharex=True)
+        for ax, prefix, title in ((axes[0], "violations", "Variazione delle violation"),
+                                  (axes[1], "warnings", "Variazione dei warning")):
+            inc = [r[f"{prefix}_increased"] for r in transition_summary]
+            dec = [r[f"{prefix}_decreased"] for r in transition_summary]
+            same = [r[f"{prefix}_unchanged"] for r in transition_summary]
+            ax.bar(x-width, inc, width, label="Aumentati")
+            ax.bar(x, dec, width, label="Diminuiti")
+            ax.bar(x+width, same, width, label="Invariati")
+            ax.set_ylabel("Numero di dataset"); ax.set_title(title); ax.legend()
+            ax.grid(axis="y", linestyle=":", alpha=.4); ax.set_axisbelow(True)
+        axes[1].set_xticks(x, labels, rotation=35, ha="right")
+        fig.suptitle("Confronto appaiato dei risultati tra versioni DCAT-AP")
+        fig.tight_layout(); fig.savefig(output_dir/"paired_version_changes.png", dpi=220, bbox_inches="tight"); plt.close(fig)
+
+    # Chart 4: component prevalence heatmaps, separate panels by severity.
+    if component_records:
+        components = sorted({r["constraint_component"] for r in component_records})
+        profiles = [r["shape_model"] for r in profile_rows]
+        fig, axes = plt.subplots(2, 1, figsize=(max(11, len(profiles)*.7), max(7, len(components)*.42)), sharex=True)
+        for ax, severity in zip(axes, ("Violation", "Warning")):
+            matrix = np.zeros((len(components), len(profiles)))
+            lookup = {(r["shape_model"], r["constraint_component"]): r["affected_pct"]
+                      for r in component_records if r["severity"] == severity}
+            for yi, component in enumerate(components):
+                for xi, profile in enumerate(profiles):
+                    matrix[yi, xi] = lookup.get((profile, component), 0)
+            image = ax.imshow(matrix, aspect="auto", vmin=0, vmax=100)
+            ax.set_yticks(np.arange(len(components)), components)
+            ax.set_title(f"{severity}: dataset interessati (%)")
+            fig.colorbar(image, ax=ax, label="Dataset (%)")
+        axes[1].set_xticks(np.arange(len(profiles)), profiles, rotation=65, ha="right")
+        fig.suptitle("Prevalenza delle componenti SHACL per configurazione")
+        fig.tight_layout(); fig.savefig(output_dir/"shacl_component_heatmap.png", dpi=220, bbox_inches="tight"); plt.close(fig)
+
+    # Chart 5: top 15 direct RDF properties, ranked by distinct datasets affected.
+    if property_records:
+        top = sorted(property_records, key=lambda r: (r["affected_datasets"], r["occurrences"]), reverse=True)[:15]
+        top.reverse()
+        fig, ax = plt.subplots(figsize=(11, max(5.5, .38*len(top))))
+        ax.barh([r["property"] for r in top], [r["affected_datasets"] for r in top])
+        ax.set_xlabel("Dataset interessati (almeno una violation)")
+        ax.set_ylabel("Proprietà RDF diretta")
+        ax.set_title("Proprietà RDF maggiormente coinvolte nelle violation")
+        ax.grid(axis="x", linestyle=":", alpha=.4); ax.set_axisbelow(True)
+        fig.tight_layout(); fig.savefig(output_dir/"rdf_property_violations.png", dpi=220, bbox_inches="tight"); plt.close(fig)
+
+    charts = ["validation_outcomes.png", "shacl_result_distributions.png", "paired_version_changes.png",
+              "shacl_component_heatmap.png", "rdf_property_violations.png"]
+    return {"datasets_in_inventory": dataset_count,
+        "fetch_status": {r[0]: r[1] for r in fetch_counts},
+        "successful_validation_rows": len(validations), "profiles": len(profile_rows),
+        "paired_comparisons": len(pairs), "shacl_result_rows": len(result_rows),
+        "path_categories": dict(Counter(r["path_type"] for r in path_records)),
+        "charts_generated": sum((output_dir/name).is_file() for name in charts),
+        "output_dir": str(output_dir.resolve())}
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Analisi statistica read-only del database MQA"
-    )
-    parser.add_argument("--db", type=Path, default=Path("analysis.db"),
-                        help="Percorso di analysis.db")
-    parser.add_argument("--out", type=Path, default=Path("analysis-output"),
-                        help="Directory output CSV/PNG")
+    parser = argparse.ArgumentParser(description="Analisi descrittiva read-only del database MQA")
+    parser.add_argument("--db", type=Path, default=Path("analysis.db"), help="Percorso di analysis.db")
+    parser.add_argument("--out", type=Path, default=Path("analysis-output"), help="Directory output CSV/PNG")
     args = parser.parse_args()
-    summary = analyze_database(args.db, args.out)
-    for key, value in summary.items():
+    for key, value in analyze_database(args.db, args.out).items():
         print(f"{key}: {value}")
 
 

@@ -253,7 +253,7 @@ La tabella `validations` contiene il risultato o lo stato di esecuzione per ogni
 (dataset_id, validator_url, shape_model)
 ```
 
-Oltre ai dati aggregati del report SHACL, la v0.4.3 conserva il corpo originale e indicizza ogni risultato individuale.
+Oltre ai dati aggregati del report SHACL, la versione corrente conserva il corpo originale e indicizza ogni risultato individuale.
 
 - `validations`: esito aggregato per dataset e profilo, contatori, stato HTTP, errore, checksum SHA-256, Content-Type e formato.
   Il corpo originale della risposta è conservato nella colonna `report_body_gzip` come BLOB compresso con gzip; le dimensioni sono
@@ -316,7 +316,7 @@ GROUP BY v.shape_model, r.result_path, r.source_constraint_component, r.severity
 ORDER BY datasets DESC, occurrences DESC;
 ```
 
-I report delle versioni precedenti non erano stati salvati. Quando la v0.4.3 aggiorna un database precedente, i dataset con validazioni
+I report delle versioni precedenti non erano stati salvati. Quando viene aggiornato un database precedente, i dataset con validazioni
 riuscite ma senza report vengono rimessi in coda `pending`, così `run` può acquisire il corpo originale e i dettagli individuali. I file RDF
 già scaricati non vengono riscaricati. Nel database incluso nell’archivio la migrazione è già stata applicata: restano presenti 61.721
 dataset e 22 validazioni aggregate precedenti; queste ultime non contengono ancora i nuovi report, per cui il dataset corrispondente è già
@@ -410,14 +410,13 @@ secondario.
 
 ## Output del progetto
 
-Il progetto non genera report `.csv` o `.md`.
-
-Gli output persistenti sono:
+Gli output della pipeline sono:
 
 - `analysis.db` — inventario e risultati/stati delle validazioni;
 - `data/rdf/*.ttl` — copie locali dei metadata RDF recuperati dal piveau Hub.
+- `analysis-output/` — CSV e grafici PNG prodotti su richiesta dal modulo di analisi.
 
-Il database è quindi la fonte strutturata dei risultati dell'esperimento.
+Il database è la fonte strutturata dei risultati dell'esperimento; gli output di analisi sono derivati e possono essere rigenerati in qualsiasi momento.
 
 ## Nota metodologica
 
@@ -434,16 +433,57 @@ dichiarati dal suo OpenAPI.
 
 ## Analisi statistica del database
 
-Il modulo `src.analysis` legge `analysis.db` in sola lettura e produce riepiloghi CSV e grafici PNG, senza modificare il database. Richiede `matplotlib` (incluso tra le dipendenze del progetto).
+Il modulo `src.analysis` legge `analysis.db` in sola lettura e produce cinque grafici PNG e tabelle CSV. Non modifica il database e considera soltanto le validazioni concluse con `execution_status='validated'`, HTTP 200, `conforms` valorizzato e nessun errore registrato. Le righe `skipped`, `error` e le risposte non interpretabili sono escluse dalle analisi degli esiti; non vengono mai riclassificate come non conformità.
+
+Dipendenze (già incluse nell'installazione del progetto): `matplotlib` e `numpy`.
 
 ```bash
 python -m src.analysis
 ```
 
-Percorsi personalizzati:
+È possibile specificare il database e la directory di destinazione:
 
 ```bash
 python -m src.analysis --db /percorso/analysis.db --out risultati-analisi
 ```
 
-Output: `profile_summary.csv` e `profile_conformance.png` (conformità per profilo), `version_transitions.csv` e `version_transitions.png` (transizioni tra versioni DCAT-AP consecutive), `shacl_issues.csv` (frequenza delle issue per shape, componente e percorso). La conformità è calcolata solo sulle validazioni completate con HTTP 200 e `conforms` valorizzato; righe `error` e `skipped` non entrano nel denominatore. Il confronto tra versioni usa esclusivamente profili base `dcatap<versione>`, escludendo i profili `level1/2/3`.
+### Grafici generati
+
+1. **`validation_outcomes.png` — Distribuzione degli esiti per shape model.** Barre sovrapposte al 100% con tre categorie mutuamente esclusive: nessun risultato SHACL; risultati senza violation (warning e/o info); almeno una violation. La categoria con violation può contenere anche warning e info. La percentuale di conformità rimane disponibile nel CSV, ma non è l'unica misura mostrata: in campioni con conformità rara la distribuzione dei risultati è più informativa.
+2. **`shacl_result_distributions.png` — Distribuzione di violation e warning per dataset.** Due boxplot separati mostrano la dispersione dei conteggi per validazione e shape model. I dati individuali sono conservati in `validation_distribution.csv`.
+3. **`paired_version_changes.png` — Variazione appaiata dei risultati tra versioni.** Per ogni dataset presente in entrambe le configurazioni, confronta i conteggi di violation e warning tra versioni DCAT-AP consecutive, mantenendo costante il livello (`base`, `level1`, `level2` o `level3`). Il grafico conta i dataset per cui il numero di risultati aumenta, diminuisce o rimane invariato. I confronti sono possibili solo per coppie effettivamente disponibili e concluse.
+4. **`shacl_component_heatmap.png` — Prevalenza delle componenti SHACL.** Due heatmap (Violation e Warning) riportano, per ogni componente e shape model, la percentuale di dataset validati interessati da almeno un risultato della componente. Il CSV include anche il numero assoluto di occorrenze e di dataset coinvolti.
+5. **`rdf_property_violations.png` — Proprietà RDF maggiormente coinvolte.** Mostra le prime 15 proprietà IRI dirette, ordinate per numero di dataset distinti con almeno una violation. Non confonde il numero di occorrenze con la diffusione del problema tra dataset.
+
+### CSV prodotti
+
+- `profile_summary.csv`: numero di validazioni concluse, conformità, conteggi di violation/warning/info e distribuzione percentuale delle tre categorie di esito.
+- `validation_distribution.csv`: conteggi individuali per dataset e shape model, base per boxplot e ulteriori statistiche descrittive.
+- `paired_version_deltas.csv`: variazioni individuali dei conteggi tra coppie di versioni allo stesso livello.
+- `paired_version_summary.csv`: numero di dataset con conteggi aumentati, diminuiti o invariati per livello e coppia di versioni.
+- `shacl_components.csv`: occorrenze, dataset interessati e prevalenza per componente SHACL, configurazione e severità.
+- `shacl_paths.csv`: classificazione dei percorsi SHACL, con occorrenze e dataset interessati.
+- `violations_by_rdf_property.csv`: riepilogo delle proprietà RDF dirette coinvolte nelle violation.
+
+### Classificazione dei percorsi SHACL
+
+Il campo `validation_results.result_path` contiene la rappresentazione testuale del termine RDF associato a `sh:resultPath`. Non è corretto considerare ogni valore come una proprietà RDF: SHACL consente anche percorsi composti o inversi rappresentati mediante blank node e liste RDF. Inoltre, gli identificatori dei blank node sono locali al documento e non sono categorie semanticamente confrontabili tra report.
+
+L'analisi applica quindi questa classificazione:
+
+- `simple_iri`: il termine `sh:resultPath` è un IRI. È trattato come proprietà RDF diretta e può comparire nel grafico delle proprietà.
+- `complex_resolved`: il termine è un blank node, ma la sua espressione viene ricostruita dal report RDF originale. Sono supportati percorsi inversi, sequenze, alternative e operatori zero-or-more, one-or-more e zero-or-one.
+- `complex_unresolved`: il termine è un blank node, ma non è possibile ricostruirne l'espressione dal report conservato. È mantenuto come categoria aggregata, mai come identificatore individuale.
+- `missing` e `unclassified`: percorso assente o termine non classificabile.
+
+Per ricostruire un percorso complesso, l'analisi rilegge il report Turtle compresso conservato in `validations.report_body_gzip`. RDFLib può assegnare nuovi identificatori ai blank node durante il parsing: per questo il nodo `sh:ValidationResult` viene ritrovato attraverso le sue proprietà semantiche (focus node, componente, severità e messaggio), invece di riutilizzare direttamente l'etichetta del blank node memorizzata in `properties_json`.
+
+I percorsi complessi restano disponibili in `shacl_paths.csv`, ma sono esclusi dal ranking delle proprietà RDF dirette. Questo evita di presentare identificatori tecnici o espressioni SHACL come se fossero proprietà semplici.
+
+### Interpretazione e limiti
+
+Le versioni sono confrontate soltanto a parità di livello di validazione. Il profilo base (`dcatap<versione>`) non viene aggregato con `level1`, `level2` o `level3`, perché applicano insiemi di vincoli differenti. Il confronto appaiato usa lo stesso `dataset_id` e lo stesso `validator_url`; i dataset senza entrambe le validazioni concluse sono esclusi dal confronto e il numero di coppie effettive è riportato nei CSV.
+
+Un aumento del numero di violation o warning indica un aumento dei risultati prodotti dalla configurazione, non dimostra da solo un peggioramento intrinseco dei metadati: tra versioni possono cambiare le shape e i vincoli applicati. Analogamente, più risultati SHACL non equivalgono necessariamente a più requisiti distinti violati, perché uno stesso problema può generare più risultati. Per questo i riepiloghi riportano sia le occorrenze sia il numero di dataset distinti interessati.
+
+La conformità è conservata e riportata, ma quando è molto rara o uniforme non è sufficiente da sola a distinguere le configurazioni. Le analisi affiancano quindi allo stato binario la distribuzione dei risultati, la loro dispersione, le variazioni appaiate e le componenti/proprietà coinvolte.
