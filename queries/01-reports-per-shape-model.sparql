@@ -1,0 +1,11 @@
+PREFIX mqa: <urn:mqa:vocab:>
+
+SELECT ?shapeModel (COUNT(?report) AS ?reports)
+WHERE {
+  GRAPH <urn:mqa:validation-catalog> {
+    ?report a mqa:ValidationReport ;
+            mqa:shapeModel ?shapeModel .
+  }
+}
+GROUP BY ?shapeModel
+ORDER BY ?shapeModel

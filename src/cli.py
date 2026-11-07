@@ -1,9 +1,9 @@
 import argparse
-import gzip
 import hashlib
 import json
 import logging
 import os
+from pathlib import Path
 import sys
 import time
 from urllib.parse import quote
@@ -29,7 +29,7 @@ def _clients(cfg: Config):
         repo_base_url=cfg.repo_base_url,
         timeout=cfg.timeout,
     )
-    db = Database(db_path=cfg.db_path)
+    db = Database(db_path=cfg.db_path, report_store_path=cfg.report_store_path)
     db.init_schema()
     return hub, db
 
@@ -177,24 +177,32 @@ def _load_validation_profiles(cfg: Config) -> tuple[ProfileSource, list[list[str
 
 def _save_result(
     db: Database, dataset_id: str, validator_url: str, result, execution_status: str,
-) -> None:
-    db.save_validation_result(
-        dataset_id=dataset_id,
-        validator_url=validator_url,
-        shape_model=result.shape_model,
-        conforms=result.conforms,
-        results=result.results,
-        violations=result.violations,
-        warnings=result.warnings,
-        infos=result.infos,
-        http_status=result.http_status,
-        error=result.error,
-        execution_status=execution_status,
-        report_body=result.report_body,
-        report_content_type=result.report_content_type,
-        report_parsed=result.report_parsed,
-        validation_details=result.validation_details,
-    )
+) -> bool:
+    try:
+        db.save_validation_result(
+            dataset_id=dataset_id,
+            validator_url=validator_url,
+            shape_model=result.shape_model,
+            conforms=result.conforms,
+            results=result.results,
+            violations=result.violations,
+            warnings=result.warnings,
+            infos=result.infos,
+            http_status=result.http_status,
+            error=result.error,
+            execution_status=execution_status,
+            report_body=result.report_body,
+            report_content_type=result.report_content_type,
+            report_parsed=result.report_parsed,
+            report_format=result.report_format,
+        )
+        return True
+    except Exception:
+        logger.exception(
+            "[%s] profile %s: errore nel salvataggio dei metadati/report",
+            dataset_id, result.shape_model,
+        )
+        return False
 
 
 def _save_skipped(db: Database, dataset_id: str, validator_url: str, profile: str, prerequisite: str) -> None:
@@ -236,7 +244,8 @@ def _run_chain(
         result = validator.validate(rdf_data=rdf_bytes, shape_model=profile)
 
         if result.http_status == 200 and result.conforms is not None and not result.error:
-            _save_result(db, dataset_id, validator_url, result, "validated")
+            if not _save_result(db, dataset_id, validator_url, result, "validated"):
+                return False
         else:
             _save_result(db, dataset_id, validator_url, result, "error")
             logger.error(
@@ -312,7 +321,8 @@ def run_validation(limit: int | None = None, short_circuit: bool = False) -> int
                     logger.debug("[%s] SHACL validation: %s", dataset_id, profile)
                     result = validator.validate(rdf_data=rdf_bytes, shape_model=profile)
                     if result.http_status == 200 and result.conforms is not None and not result.error:
-                        _save_result(db, dataset_id, cfg.validator_url, result, "validated")
+                        if not _save_result(db, dataset_id, cfg.validator_url, result, "validated"):
+                            all_operations_terminal = False
                     else:
                         all_operations_terminal = False
                         _save_result(db, dataset_id, cfg.validator_url, result, "error")
@@ -357,36 +367,129 @@ def run_validation(limit: int | None = None, short_circuit: bool = False) -> int
     return completed
 
 
+def _rdf_term_json(term):
+    from rdflib import BNode, Literal, URIRef
+
+    if isinstance(term, URIRef):
+        value = {"term_type": "uri", "value": str(term)}
+    elif isinstance(term, BNode):
+        value = {"term_type": "bnode", "value": str(term)}
+    elif isinstance(term, Literal):
+        value = {
+            "term_type": "literal",
+            "value": str(term),
+            "datatype": str(term.datatype) if term.datatype else None,
+            "language": term.language,
+        }
+    else:
+        value = {"term_type": type(term).__name__, "value": str(term)}
+    return value
+
+
+def _local_iri_name(value):
+    return str(value).rsplit("#", 1)[-1].rsplit("/", 1)[-1] if value else None
+
+
 def show_report_details(
     dataset_id: str | None = None, profile: str | None = None,
     severity: str | None = None, limit: int = 50, raw_report: bool = False,
 ) -> int:
-    """Print indexed result details or the original decompressed report to stdout."""
+    """Read report data from Oxigraph; SQLite is used only for report metadata."""
+    from rdflib import RDF
+    from rdflib.namespace import SH
+
     cfg = Config()
-    db = Database(db_path=cfg.db_path)
+    db = Database(db_path=cfg.db_path, report_store_path=cfg.report_store_path)
     db.init_schema()
+    if raw_report and (not dataset_id or not profile):
+        raise SystemExit("--raw-report richiede sia --dataset-id sia --profile")
+
+    validations = db.get_validation_report_rows(
+        successful_only=True, dataset_id=dataset_id, profile=profile
+    )
+    if not validations:
+        raise SystemExit("Nessun report SHACL corrispondente trovato nel triplestore")
+
+    store = db.get_report_store(read_only=True)
     if raw_report:
-        if not dataset_id or not profile:
-            raise SystemExit("--raw-report richiede sia --dataset-id sia --profile")
-        row = db.get_raw_report(dataset_id, profile)
-        if row is None or row["report_body_gzip"] is None:
-            raise SystemExit(f"Nessun report salvato per dataset={dataset_id}, profile={profile}")
-        sys.stdout.buffer.write(gzip.decompress(row["report_body_gzip"]))
+        validation = validations[0]
+        body = store.dump_report(validation["report_graph_iri"], validation["report_format"] or "turtle")
+        sys.stdout.buffer.write(body)
         return 1
 
-    rows = db.get_validation_details(dataset_id, profile, severity, limit)
     payload = []
-    for row in rows:
-        item = dict(row)
-        try:
-            item["properties"] = json.loads(item.pop("properties_json"))
-        except (TypeError, json.JSONDecodeError):
-            item["properties"] = {}
-        payload.append(item)
+    max_results = max(1, min(limit, 10000))
+    for validation in validations:
+        graph = store.get_report_graph(validation["report_graph_iri"])
+        nodes = sorted(graph.subjects(RDF.type, SH.ValidationResult), key=lambda node: node.n3())
+        for node in nodes:
+            severities = list(graph.objects(node, SH.resultSeverity))
+            result_severity = _local_iri_name(severities[0]) if severities else None
+            if severity and (result_severity or "").casefold() != severity.casefold():
+                continue
+            properties = {}
+            for predicate, obj in graph.predicate_objects(node):
+                properties.setdefault(str(predicate), []).append(_rdf_term_json(obj))
+            for values in properties.values():
+                values.sort(key=lambda item: (
+                    item.get("value", ""), item.get("datatype") or "", item.get("language") or ""
+                ))
+
+            def first_value(predicate):
+                values = list(graph.objects(node, predicate))
+                return _rdf_term_json(values[0]) if values else None
+
+            components = list(graph.objects(node, SH.sourceConstraintComponent))
+            messages = sorted(str(value) for value in graph.objects(node, SH.resultMessage))
+            payload.append({
+                "validation_id": validation["id"],
+                "dataset_id": validation["dataset_id"],
+                "shape_model": validation["shape_model"],
+                "conforms": validation["conforms"],
+                "severity": result_severity,
+                "focus_node": first_value(SH.focusNode),
+                "result_path": first_value(SH.resultPath),
+                "value": first_value(SH.value),
+                "source_shape": first_value(SH.sourceShape),
+                "source_constraint_component": _local_iri_name(components[0]) if components else None,
+                "message": messages,
+                "properties": properties,
+            })
+            if len(payload) >= max_results:
+                break
+        if len(payload) >= max_results:
+            break
+
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     logger.info("Displayed %d individual SHACL result(s)", len(payload))
     return len(payload)
 
+
+
+def run_sparql(query: str, output_format: str = "tsv") -> None:
+    """Execute a read-only SPARQL query against the PyOxigraph store."""
+    from src.report_store import ValidationReportStore
+
+    cfg = Config()
+    store = ValidationReportStore(cfg.report_store_path, read_only=True)
+    result = store.query(query)
+    if hasattr(result, "variables"):
+        variables = [str(variable) for variable in result.variables]
+        rows = [
+            {name: (str(solution[variable]) if solution[variable] is not None else None)
+             for name, variable in zip(variables, result.variables)}
+            for solution in result
+        ]
+        if output_format == "json":
+            print(json.dumps(rows, ensure_ascii=False, indent=2))
+        else:
+            print("\t".join(variables))
+            for row in rows:
+                print("\t".join((row[name] or "").replace("\t", " ").replace("\n", " ") for name in variables))
+    elif type(result).__name__ == "QueryBoolean":
+        print("true" if bool(result) else "false")
+    else:
+        raise SystemExit("Il comando sparql supporta query SELECT e ASK; per CONSTRUCT usare Oxigraph Server/YASGUI.")
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -447,13 +550,21 @@ def main() -> None:
 
     report_parser = subparsers.add_parser(
         "reports",
-        help="Interroga i singoli risultati SHACL memorizzati nel database e stampa JSON su stdout",
+        help="Interroga i report SHACL memorizzati nel triplestore e stampa JSON su stdout",
     )
     report_parser.add_argument("--dataset-id", default=None, help="Filtra per ID del dataset")
     report_parser.add_argument("--profile", default=None, help="Filtra per shapeModel, ad esempio dcatap301level1")
     report_parser.add_argument("--severity", choices=["Violation", "Warning", "Info"], default=None, help="Filtra per severità SHACL")
     report_parser.add_argument("--limit", type=int, default=50, help="Numero massimo di ValidationResult mostrati (default: 50, massimo: 10000)")
-    report_parser.add_argument("--raw-report", action="store_true", help="Stampa il corpo originale del report decompresso; richiede --dataset-id e --profile")
+    report_parser.add_argument("--raw-report", action="store_true", help="Serializza il report dal triplestore su stdout; richiede --dataset-id e --profile")
+
+    sparql_parser = subparsers.add_parser(
+        "sparql", help="Esegue una query SPARQL SELECT/ASK sul triplestore (sola lettura)",
+    )
+    sparql_source = sparql_parser.add_mutually_exclusive_group(required=True)
+    sparql_source.add_argument("--query-file", type=str, help="File .sparql da eseguire")
+    sparql_source.add_argument("--query", type=str, help="Query SPARQL passata direttamente")
+    sparql_parser.add_argument("--format", choices=["tsv", "json"], default="tsv", help="Formato dell'output SELECT (default: tsv)")
 
     args = parser.parse_args()
 
@@ -471,6 +582,9 @@ def main() -> None:
         run_validation(limit=args.limit, short_circuit=args.short_circuit)
     elif args.command == "reports":
         show_report_details(args.dataset_id, args.profile, args.severity, args.limit, args.raw_report)
+    elif args.command == "sparql":
+        query = Path(args.query_file).read_text(encoding="utf-8") if args.query_file else args.query
+        run_sparql(query, args.format)
     else:
         parser.print_help()
 

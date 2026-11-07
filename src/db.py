@@ -1,15 +1,37 @@
-import gzip
 import hashlib
+import logging
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
+logger = logging.getLogger(__name__)
+
 
 class Database:
-    def __init__(self, db_path: Path | str = "analysis.db"):
+    def __init__(
+        self,
+        db_path: Path | str = "analysis.db",
+        report_store_path: Path | str = "data/validation-reports",
+        report_store=None,
+    ):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.report_store_path = Path(report_store_path)
+        self._report_store = report_store
+
+    def get_report_store(self, *, read_only: bool = False):
+        """Open the configured PyOxigraph store lazily and reuse the instance."""
+        if self._report_store is None:
+            from src.report_store import ValidationReportStore
+            self._report_store = ValidationReportStore(
+                self.report_store_path, read_only=read_only
+            )
+        elif read_only and not getattr(self._report_store, "read_only", False):
+            # An already-open writable store is safe for reads and avoids
+            # opening the same RocksDB directory twice in one process.
+            return self._report_store
+        return self._report_store
 
     @contextmanager
     def get_connection(self) -> Iterator[sqlite3.Connection]:
@@ -43,7 +65,14 @@ class Database:
         ).fetchone() is not None
 
     def init_schema(self) -> None:
-        """Create tables and migrate older project databases in-place."""
+        """Create the current schema and discard obsolete report-normalization tables.
+
+        The report-storage redesign is intentionally a clean data boundary:
+        legacy validation rows are not migrated because they point to reports
+        stored as SQLite BLOBs and cannot be treated as reports already present
+        in the triplestore. The old dataset inventory is also discarded so the
+        new experiment starts from a clean SQLite population.
+        """
         with self.get_connection() as conn:
             conn.execute("PRAGMA journal_mode = WAL")
             conn.execute("""
@@ -65,148 +94,70 @@ class Database:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            columns = {r["name"] for r in conn.execute("PRAGMA table_info(datasets)")}
-            migrations = {
+            dataset_columns = {r["name"] for r in conn.execute("PRAGMA table_info(datasets)")}
+            for name, definition in {
                 "position": "INTEGER",
                 "category_id": "TEXT",
                 "discovered_at": "TIMESTAMP",
                 "fetched_at": "TIMESTAMP",
                 "validation_status": "TEXT NOT NULL DEFAULT 'pending'",
                 "validation_error": "TEXT",
-            }
-            for name, definition in migrations.items():
-                if name not in columns:
+            }.items():
+                if name not in dataset_columns:
                     conn.execute(f"ALTER TABLE datasets ADD COLUMN {name} {definition}")
 
-            validations_columns = {r["name"] for r in conn.execute("PRAGMA table_info(validations)")} if self._table_exists(conn, "validations") else set()
+            old_validation_columns = (
+                {r["name"] for r in conn.execute("PRAGMA table_info(validations)")}
+                if self._table_exists(conn, "validations") else set()
+            )
+            # The previous schema stored compressed reports in SQLite and
+            # normalized every ValidationResult into validation_results. Those
+            # rows have no corresponding named graph, so reset them once.
+            if old_validation_columns and (
+                "report_graph_iri" not in old_validation_columns
+                or "report_body_gzip" in old_validation_columns
+            ):
+                conn.execute("DROP TABLE IF EXISTS validation_results")
+                conn.execute("DROP TABLE IF EXISTS validations")
+                conn.execute("DELETE FROM datasets")
+            else:
+                # The table is no longer part of the schema, including when a
+                # user manually retained it from an earlier release.
+                conn.execute("DROP TABLE IF EXISTS validation_results")
 
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS validations (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    dataset_id TEXT,
-                    validator_url TEXT,
-                    shape_model TEXT,
+                    dataset_id TEXT NOT NULL,
+                    validator_url TEXT NOT NULL,
+                    shape_model TEXT NOT NULL,
                     conforms INTEGER,
-                    results INTEGER,
-                    violations INTEGER,
-                    warnings INTEGER,
-                    infos INTEGER,
+                    results INTEGER NOT NULL DEFAULT 0,
+                    violations INTEGER NOT NULL DEFAULT 0,
+                    warnings INTEGER NOT NULL DEFAULT 0,
+                    infos INTEGER NOT NULL DEFAULT 0,
                     http_status INTEGER,
                     error TEXT,
-                    execution_status TEXT NOT NULL DEFAULT 'validated',
-                    report_body_gzip BLOB,
+                    execution_status TEXT NOT NULL DEFAULT 'pending',
+                    report_graph_iri TEXT,
                     report_sha256 TEXT,
                     report_content_type TEXT,
                     report_format TEXT,
+                    report_status TEXT NOT NULL DEFAULT 'not_available',
+                    report_triples INTEGER,
                     report_saved_at TIMESTAMP,
                     validated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (dataset_id) REFERENCES datasets (dataset_id),
                     UNIQUE(dataset_id, validator_url, shape_model)
                 )
             """)
-            validations_columns = {r["name"] for r in conn.execute("PRAGMA table_info(validations)")}
-            if "execution_status" not in validations_columns:
-                conn.execute("ALTER TABLE validations ADD COLUMN execution_status TEXT NOT NULL DEFAULT 'validated'")
-                # Existing v0.4.1 rows did not have execution_status. An error
-                # row must not become a successful validation just because the
-                # migration supplied the new column's default value.
-
-            report_columns = {
-                "report_body_gzip": "BLOB",
-                "report_sha256": "TEXT",
-                "report_content_type": "TEXT",
-                "report_format": "TEXT",
-                "report_saved_at": "TIMESTAMP",
-            }
-            reports_need_migration = any(name not in validations_columns for name in report_columns)
-            for name, definition in report_columns.items():
-                if name not in validations_columns:
-                    conn.execute(f"ALTER TABLE validations ADD COLUMN {name} {definition}")
-
-            # Remove report fields that are derivable from the BLOB or unused by
-            # the analysis. SQLite DROP COLUMN preserves the remaining records.
-            validations_columns = {r["name"] for r in conn.execute("PRAGMA table_info(validations)")}
-            for name in ("report_size_bytes", "report_compressed_size_bytes", "report_metadata_json"):
-                if name in validations_columns:
-                    conn.execute(f"ALTER TABLE validations DROP COLUMN {name}")
-
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS validation_results (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    validation_id INTEGER NOT NULL,
-                    result_node TEXT,
-                    focus_node TEXT,
-                    result_path TEXT,
-                    value TEXT,
-                    source_shape TEXT,
-                    source_constraint_component TEXT,
-                    severity TEXT,
-                    message TEXT,
-                    properties_json TEXT NOT NULL,
-                    FOREIGN KEY (validation_id) REFERENCES validations(id) ON DELETE CASCADE
-                )
-            """)
-            # Drop result_index and its UNIQUE constraint from older schemas.
-            # Results are already sorted deterministically by the parser and are
-            # inserted in that order; the row id now provides stable query order.
-            result_columns = {r["name"] for r in conn.execute("PRAGMA table_info(validation_results)")}
-            if "result_index" in result_columns:
-                conn.execute("DROP INDEX IF EXISTS idx_validation_results_severity")
-                conn.execute("DROP INDEX IF EXISTS idx_validation_results_focus_path")
-                conn.execute("ALTER TABLE validation_results RENAME TO validation_results_legacy")
-                conn.execute("""
-                    CREATE TABLE validation_results (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        validation_id INTEGER NOT NULL,
-                        result_node TEXT,
-                        focus_node TEXT,
-                        result_path TEXT,
-                        value TEXT,
-                        source_shape TEXT,
-                        source_constraint_component TEXT,
-                        severity TEXT,
-                        message TEXT,
-                        properties_json TEXT NOT NULL,
-                        FOREIGN KEY (validation_id) REFERENCES validations(id) ON DELETE CASCADE
-                    )
-                """)
-                conn.execute("""
-                    INSERT INTO validation_results (
-                        validation_id,result_node,focus_node,result_path,value,source_shape,
-                        source_constraint_component,severity,message,properties_json
-                    )
-                    SELECT validation_id,result_node,focus_node,result_path,value,source_shape,
-                           source_constraint_component,severity,message,properties_json
-                    FROM validation_results_legacy
-                    ORDER BY validation_id,result_index,id
-                """)
-                conn.execute("DROP TABLE validation_results_legacy")
-
-            # Idempotently repair any historical rows whose error field already
-            # proves that the validation operation did not complete successfully.
-            conn.execute("UPDATE validations SET execution_status='error' WHERE error IS NOT NULL AND TRIM(error) <> '' AND execution_status='validated'")
-
-            # On first upgrade to report capture, successful historical checks
-            # without a persisted report are marked pending so `run` can fetch
-            # their detailed reports. RDF acquisition state is not affected.
-            if reports_need_migration:
-                conn.execute("""
-                    UPDATE datasets
-                       SET validation_status='pending', validation_error=NULL
-                     WHERE fetch_status='ok'
-                       AND EXISTS (
-                           SELECT 1 FROM validations v
-                           WHERE v.dataset_id=datasets.dataset_id
-                             AND v.execution_status='validated'
-                             AND v.http_status=200
-                             AND v.report_body_gzip IS NULL
-                       )
-                """)
-
+            # Keep only the two domain tables in SQLite. PRAGMA user_version
+            # records the schema revision without adding a third application table.
+            conn.execute("DROP TABLE IF EXISTS schema_metadata")
+            conn.execute("PRAGMA user_version = 3")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_validations_lookup ON validations(dataset_id, validator_url, shape_model, execution_status)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_validations_profile_status ON validations(shape_model, execution_status, validated_at)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_validation_results_severity ON validation_results(severity, source_constraint_component)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_validation_results_focus_path ON validation_results(focus_node, result_path)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_validations_report_status ON validations(report_status, report_graph_iri)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_datasets_queue ON datasets(fetch_status, validation_status, position, dataset_id)")
             conn.commit()
 
@@ -307,7 +258,7 @@ class Database:
         if not profiles:
             return []
         placeholders = ",".join("?" for _ in profiles)
-        completed_predicate = "(v.execution_status='validated' AND v.http_status=200 AND v.conforms IS NOT NULL AND v.error IS NULL)"
+        completed_predicate = "(v.execution_status='validated' AND v.http_status=200 AND v.conforms IS NOT NULL AND v.error IS NULL AND v.report_status='stored' AND v.report_graph_iri IS NOT NULL)"
         if allow_skipped:
             completed_predicate = f"(v.execution_status='skipped' OR {completed_predicate})"
         sql = f"""
@@ -366,24 +317,18 @@ class Database:
             """, (dataset_id,catalogue_id,source_url,rdf_path,sha256,fetch_status,fetch_http_status,fetch_error))
             conn.commit()
 
-    @staticmethod
-    def _report_format(content_type: str | None, parsed: bool) -> str:
-        if not parsed:
-            return "http-body"
-        value = (content_type or "").lower()
-        if "turtle" in value:
-            return "turtle"
-        if "ld+json" in value or "json" in value:
-            return "json-ld"
-        if "rdf+xml" in value or "xml" in value:
-            return "rdf-xml"
-        if "n-triples" in value:
-            return "n-triples"
-        if "trig" in value:
-            return "trig"
-        if "n3" in value:
-            return "n3"
-        return "rdf"
+    def _remove_report_graph(self, graph_iri: str | None) -> None:
+        """Best-effort cleanup for a report no longer referenced by SQLite."""
+        if not graph_iri:
+            return
+        try:
+            self.get_report_store().remove_report(graph_iri)
+        except Exception:
+            logger.warning(
+                "Il report non più referenziato %s non è stato rimosso dal triplestore",
+                graph_iri,
+                exc_info=True,
+            )
 
     def save_validation_result(
         self,
@@ -401,110 +346,177 @@ class Database:
         report_body: bytes | None = None,
         report_content_type: str | None = None,
         report_parsed: bool = False,
-        validation_details: list[dict] | None = None,
-    ) -> None:
-        """Upsert a validation and its gzip-compressed original report.
+        report_format: str | None = None,
+    ) -> int:
+        """Persist validation metadata in SQLite and the complete RDF report in Oxigraph.
 
-        Keeping the compressed body in the validation row avoids generating
-        hundreds of thousands of small files at catalogue scale. Normalized
-        result rows are stored separately for indexed analysis.
+        SQLite is committed before writing to Oxigraph. ``report_status`` makes
+        the two-store operation recoverable: a successful validation is only
+        considered complete after its report graph has been stored and verified.
+        Report graph IRIs are content-addressed to make retries idempotent.
         """
         if execution_status is None:
             execution_status = "error" if error else "validated"
         if execution_status not in {"validated", "skipped", "error"}:
             raise ValueError(f"Unsupported execution_status: {execution_status}")
-        conforms_val = None if conforms is None else int(conforms)
-        details = validation_details or []
-        compressed_body = gzip.compress(report_body, compresslevel=6, mtime=0) if report_body else None
-        report_sha256 = hashlib.sha256(report_body).hexdigest() if report_body else None
-        report_format = self._report_format(report_content_type, report_parsed) if report_body else None
+
+        is_rdf_report = bool(report_body and report_parsed and report_format)
+        report_sha256 = hashlib.sha256(report_body).hexdigest() if is_rdf_report else None
+        report_status = "pending" if is_rdf_report else "not_available"
+        conforms_value = None if conforms is None else int(conforms)
+
+        with self.get_connection() as conn:
+            previous = conn.execute(
+                "SELECT report_graph_iri FROM validations "
+                "WHERE dataset_id=? AND validator_url=? AND shape_model=?",
+                (dataset_id, validator_url, shape_model),
+            ).fetchone()
+            previous_graph_iri = previous["report_graph_iri"] if previous else None
+            conn.execute("""
+                INSERT INTO validations (
+                    dataset_id, validator_url, shape_model, conforms, results,
+                    violations, warnings, infos, http_status, error, execution_status,
+                    report_graph_iri, report_sha256, report_content_type, report_format,
+                    report_status, report_triples, report_saved_at, validated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, NULL, NULL, CURRENT_TIMESTAMP)
+                ON CONFLICT(dataset_id, validator_url, shape_model) DO UPDATE SET
+                    conforms=excluded.conforms,
+                    results=excluded.results,
+                    violations=excluded.violations,
+                    warnings=excluded.warnings,
+                    infos=excluded.infos,
+                    http_status=excluded.http_status,
+                    error=excluded.error,
+                    execution_status=excluded.execution_status,
+                    report_content_type=excluded.report_content_type,
+                    report_format=excluded.report_format,
+                    report_status=excluded.report_status,
+                    validated_at=CURRENT_TIMESTAMP
+            """, (
+                dataset_id, validator_url, shape_model, conforms_value, results,
+                violations, warnings, infos, http_status, error, execution_status,
+                report_content_type, report_format if is_rdf_report else None,
+                report_status,
+            ))
+            row = conn.execute(
+                "SELECT id FROM validations WHERE dataset_id=? AND validator_url=? AND shape_model=?",
+                (dataset_id, validator_url, shape_model),
+            ).fetchone()
+            validation_id = int(row["id"])
+            conn.commit()
+
+        if not is_rdf_report:
+            with self.get_connection() as conn:
+                conn.execute("""
+                    UPDATE validations
+                       SET report_graph_iri=NULL, report_sha256=NULL,
+                           report_triples=NULL, report_saved_at=NULL
+                     WHERE id=?
+                """, (validation_id,))
+                conn.commit()
+            self._remove_report_graph(previous_graph_iri)
+            return validation_id
+
+        graph_iri = f"urn:mqa:validation-report:{validation_id}:{report_sha256}"
+        try:
+            report_store = self.get_report_store()
+            triple_count = report_store.save_report(graph_iri, report_body, report_format)
+            if triple_count == 0:
+                raise RuntimeError("Il report salvato non contiene triple")
+            report_store.save_report_metadata(
+                graph_iri,
+                validation_id=validation_id,
+                dataset_id=dataset_id,
+                validator_url=validator_url,
+                shape_model=shape_model,
+                conforms=conforms,
+                results=results,
+                violations=violations,
+                warnings=warnings,
+                infos=infos,
+                report_sha256=report_sha256,
+                report_format=report_format,
+                report_content_type=report_content_type,
+                report_triples=triple_count,
+            )
+        except Exception as exc:
+            message = f"Report SHACL non persistito nel triplestore: {exc}"
+            with self.get_connection() as conn:
+                conn.execute("""
+                    UPDATE validations
+                       SET execution_status='error', report_status='error', error=?,
+                           report_graph_iri=NULL, report_sha256=NULL,
+                           report_triples=NULL, report_saved_at=NULL
+                     WHERE id=?
+                """, (message, validation_id))
+                conn.commit()
+            self._remove_report_graph(previous_graph_iri)
+            raise RuntimeError(message) from exc
 
         with self.get_connection() as conn:
             conn.execute("""
-                INSERT INTO validations (
-                    dataset_id,validator_url,shape_model,conforms,results,violations,warnings,infos,
-                    http_status,error,execution_status,report_body_gzip,report_sha256,
-                    report_content_type,report_format,report_saved_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)
-                ON CONFLICT(dataset_id,validator_url,shape_model) DO UPDATE SET
-                    conforms=excluded.conforms,results=excluded.results,violations=excluded.violations,
-                    warnings=excluded.warnings,infos=excluded.infos,http_status=excluded.http_status,
-                    error=excluded.error,execution_status=excluded.execution_status,
-                    report_body_gzip=excluded.report_body_gzip,report_sha256=excluded.report_sha256,
-                    report_content_type=excluded.report_content_type,report_format=excluded.report_format,
-                    report_saved_at=CASE WHEN excluded.report_body_gzip IS NOT NULL THEN CURRENT_TIMESTAMP ELSE NULL END,
-                    validated_at=CURRENT_TIMESTAMP
-            """, (
-                dataset_id, validator_url, shape_model, conforms_val, results, violations, warnings, infos,
-                http_status, error, execution_status, compressed_body, report_sha256,
-                report_content_type, report_format,
-            ))
-            validation_id = conn.execute(
-                "SELECT id FROM validations WHERE dataset_id=? AND validator_url=? AND shape_model=?",
-                (dataset_id, validator_url, shape_model),
-            ).fetchone()[0]
-            conn.execute(
-                "UPDATE validations SET report_saved_at=CASE WHEN report_body_gzip IS NOT NULL THEN COALESCE(report_saved_at,CURRENT_TIMESTAMP) ELSE NULL END WHERE id=?",
-                (validation_id,),
-            )
-
-            conn.execute("DELETE FROM validation_results WHERE validation_id=?", (validation_id,))
-            if details:
-                conn.executemany("""
-                    INSERT INTO validation_results (
-                        validation_id,result_node,focus_node,result_path,value,source_shape,
-                        source_constraint_component,severity,message,properties_json
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?)
-                """, [
-                    (
-                        validation_id, detail.get("result_node"), detail.get("focus_node"),
-                        detail.get("result_path"), detail.get("value"), detail.get("source_shape"),
-                        detail.get("source_constraint_component"), detail.get("severity"),
-                        detail.get("message"), detail.get("properties_json", "{}"),
-                    )
-                    for detail in details
-                ])
+                UPDATE validations
+                   SET report_graph_iri=?, report_sha256=?, report_triples=?,
+                       report_status='stored', report_saved_at=CURRENT_TIMESTAMP
+                 WHERE id=?
+            """, (graph_iri, report_sha256, triple_count, validation_id))
             conn.commit()
 
-    def get_raw_report(self, dataset_id: str, profile: str) -> sqlite3.Row | None:
-        """Return the most recently saved raw report for a dataset/profile."""
-        with self.get_connection() as conn:
-            return conn.execute("""
-                SELECT report_body_gzip,report_content_type,report_format,report_sha256,
-                       report_saved_at,http_status,execution_status
-                FROM validations
-                WHERE dataset_id=? AND shape_model=? AND report_body_gzip IS NOT NULL
-                ORDER BY validated_at DESC LIMIT 1
-            """, (dataset_id, profile)).fetchone()
+        # Re-validating the same dataset/profile replaces the current report
+        # reference. Remove the previous content-addressed graph only after the
+        # new graph is safely stored and referenced from SQLite.
+        if previous_graph_iri and previous_graph_iri != graph_iri:
+            self._remove_report_graph(previous_graph_iri)
+        return validation_id
 
-    def get_validation_details(
-        self, dataset_id: str | None = None, profile: str | None = None,
-        severity: str | None = None, limit: int = 50,
-    ) -> list[sqlite3.Row]:
-        """Query indexed SHACL result details for qualitative investigation."""
+    def get_validation_report(
+        self, dataset_id: str, profile: str, validator_url: str | None = None,
+    ) -> sqlite3.Row | None:
         sql = """
-            SELECT d.dataset_id, v.shape_model, v.conforms, v.violations, v.warnings, v.infos,
-                   v.http_status, v.report_sha256, v.report_content_type, v.report_format,
-                   v.report_saved_at, v.validated_at,
-                   r.result_node, r.focus_node, r.result_path, r.value,
-                   r.source_shape, r.source_constraint_component, r.severity, r.message, r.properties_json
-            FROM validation_results r
-            JOIN validations v ON v.id=r.validation_id
+            SELECT v.*, d.dataset_id
+            FROM validations v
             JOIN datasets d ON d.dataset_id=v.dataset_id
-            WHERE 1=1
+            WHERE d.dataset_id=? AND v.shape_model=?
         """
+        params: list[object] = [dataset_id, profile]
+        if validator_url:
+            sql += " AND v.validator_url=?"
+            params.append(validator_url)
+        sql += " ORDER BY v.validated_at DESC LIMIT 1"
+        with self.get_connection() as conn:
+            return conn.execute(sql, tuple(params)).fetchone()
+
+    def get_validation_report_rows(
+        self,
+        *,
+        successful_only: bool = True,
+        dataset_id: str | None = None,
+        profile: str | None = None,
+    ) -> list[sqlite3.Row]:
+        sql = """
+            SELECT v.id, v.dataset_id, v.validator_url, v.shape_model, v.conforms,
+                   v.results, v.violations, v.warnings, v.infos, v.report_graph_iri,
+                   v.report_sha256, v.report_status, v.report_format, v.report_content_type,
+                   v.report_triples, v.report_saved_at, v.validated_at
+            FROM validations v
+        """
+        predicates = []
         params: list[object] = []
+        if successful_only:
+            predicates.extend([
+                "v.execution_status='validated'", "v.http_status=200",
+                "v.conforms IS NOT NULL", "(v.error IS NULL OR TRIM(v.error)='')",
+                "v.report_status='stored'", "v.report_graph_iri IS NOT NULL",
+            ])
         if dataset_id:
-            sql += " AND d.dataset_id=?"
+            predicates.append("v.dataset_id=?")
             params.append(dataset_id)
         if profile:
-            sql += " AND v.shape_model=?"
+            predicates.append("v.shape_model=?")
             params.append(profile)
-        if severity:
-            sql += " AND LOWER(r.severity)=LOWER(?)"
-            params.append(severity)
-        sql += " ORDER BY v.validated_at DESC, d.dataset_id, v.shape_model, r.id LIMIT ?"
-        params.append(max(1, min(limit, 10000)))
+        if predicates:
+            sql += " WHERE " + " AND ".join(predicates)
+        sql += " ORDER BY v.shape_model, v.dataset_id"
         with self.get_connection() as conn:
             return conn.execute(sql, tuple(params)).fetchall()
 
@@ -522,7 +534,7 @@ class Database:
         with self.get_connection() as conn:
             rows = conn.execute(
                 f"""
-                SELECT shape_model, execution_status, conforms, http_status, error
+                SELECT shape_model, execution_status, conforms, http_status, error, report_status, report_graph_iri
                 FROM validations
                 WHERE dataset_id=? AND validator_url=? AND shape_model IN ({placeholders})
                 """,
@@ -538,6 +550,8 @@ class Database:
                     and r["http_status"] == 200
                     and r["conforms"] is not None
                     and r["error"] is None
+                    and r["report_status"] == "stored"
+                    and bool(r["report_graph_iri"])
                 )
             }
             done = all(p in completed_profiles for p in profiles)

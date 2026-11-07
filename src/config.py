@@ -20,6 +20,8 @@ class Config:
     # Filesystem paths.
     rdf_dir: Path = Path("data/rdf")
     db_path: Path = Path("analysis.db")
+    # Persistent PyOxigraph store: one named graph per SHACL validation report.
+    report_store_path: Path = Path("data/validation-reports")
 
     # Local SHACL validator.
     validator_url: str = "http://localhost:8080/shacl/validation/report"
@@ -34,5 +36,7 @@ class Config:
             self.db_path = Path(os.environ["MQA_DB_PATH"])
         if os.environ.get("MQA_RDF_DIR"):
             self.rdf_dir = Path(os.environ["MQA_RDF_DIR"])
+        if os.environ.get("MQA_REPORT_STORE_PATH"):
+            self.report_store_path = Path(os.environ["MQA_REPORT_STORE_PATH"])
         if os.environ.get("MQA_SHACL_VALIDATOR_TIMEOUT"):
             self.validator_timeout = int(os.environ["MQA_SHACL_VALIDATOR_TIMEOUT"])

@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dcat-ap-cross-version-validator-for-eu-mqa"
-version = "0.6.6"
+version = "0.7.1"
 description = "DCAT-AP Cross-Version Validator for EU MQA: cross-version validation using the EU MQA SHACL validator"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "requests>=2.31,<3",
     "rdflib>=7.0,<8",
+    "pyoxigraph>=0.5,<0.6",
     "PyYAML>=6.0,<7",
     "matplotlib>=3.8,<4",
     "numpy>=1.26,<3",

@@ -1,0 +1,18 @@
+PREFIX mqa: <urn:mqa:vocab:>
+
+SELECT ?report ?validationId ?datasetId ?conforms ?results ?violations ?warnings ?infos ?sha256
+WHERE {
+  GRAPH <urn:mqa:validation-catalog> {
+    ?report a mqa:ValidationReport ;
+            mqa:shapeModel "dcatap301level1" ;
+            mqa:validationId ?validationId ;
+            mqa:datasetId ?datasetId ;
+            mqa:conforms ?conforms ;
+            mqa:results ?results ;
+            mqa:violations ?violations ;
+            mqa:warnings ?warnings ;
+            mqa:infos ?infos ;
+            mqa:reportSha256 ?sha256 .
+  }
+}
+ORDER BY ?datasetId

@@ -1,15 +1,13 @@
 """Read-only descriptive analysis of DCAT-AP SHACL validation results.
 
-Generates five charts and CSV tables from analysis.db. The source database is
-opened read-only. SHACL property paths are classified from RDF term types and,
-when possible, resolved from the original validation report.
+Generates five charts and CSV tables using SQLite validation metadata and the
+complete SHACL report graphs stored in PyOxigraph. Individual SHACL results are
+materialized only in memory during analysis.
 """
 from __future__ import annotations
 
 import argparse
 import csv
-import gzip
-import json
 import re
 import sqlite3
 from collections import Counter, defaultdict
@@ -130,72 +128,66 @@ def _rdf_list(graph, head):
     return items
 
 
-def _resolve_path(validation: sqlite3.Row, result_path: str | None,
-                  properties_json: str | None, graph_cache: dict[int, Any]) -> tuple[str, str]:
-    """Return (path category, readable path)."""
-    if not result_path:
+def _resolve_path(graph, result_path) -> tuple[str, str]:
+    """Classify a SHACL path term and render complex paths canonically."""
+    from rdflib import BNode, URIRef
+
+    if result_path is None:
         return "missing", "(resultPath assente)"
-    try:
-        props = json.loads(properties_json or "{}")
-        terms = props.get(SH + "resultPath", [])
-        term = terms[0] if terms else {}
-        term_type = term.get("term_type")
-    except (TypeError, ValueError, AttributeError):
-        term_type = None
-
-    if term_type == "uri" or result_path.startswith(("http://", "https://", "urn:")):
-        return "simple_iri", _short_iri(result_path)
-    if term_type != "bnode":
-        return "unclassified", "<percorso non classificabile>"
-
-    validation_id = int(validation["id"] if "id" in validation.keys() else validation["validation_id"])
-    graph = graph_cache.get(validation_id)
-    if graph is None:
-        graph_cache[validation_id] = False
-        body = validation["report_body_gzip"]
-        if body:
-            try:
-                from rdflib import Graph, BNode
-                graph = Graph()
-                graph.parse(data=gzip.decompress(body), format=validation["report_format"] or "turtle")
-                graph_cache[validation_id] = graph
-            except Exception:
-                graph = None
-    if graph:
-        try:
-            from rdflib import URIRef
-            from rdflib.namespace import RDF
-            # RDFLib assigns fresh blank-node identifiers when reparsing Turtle.
-            # Therefore the BNode label stored in properties_json cannot be
-            # looked up directly. Re-identify the ValidationResult by its stable
-            # semantic fields, then follow its sh:resultPath object.
-            candidates = list(graph.subjects(RDF.type, URIRef(SH + "ValidationResult")))
-            for candidate in candidates:
-                focus_values = list(graph.objects(candidate, URIRef(SH + "focusNode")))
-                component_values = list(graph.objects(candidate, URIRef(SH + "sourceConstraintComponent")))
-                severity_values = list(graph.objects(candidate, URIRef(SH + "resultSeverity")))
-                message_values = list(graph.objects(candidate, URIRef(SH + "resultMessage")))
-                if validation["focus_node"] and not any(str(x) == validation["focus_node"] for x in focus_values):
-                    continue
-                if validation["source_constraint_component"] and not any(str(x).rsplit("#", 1)[-1] == validation["source_constraint_component"] for x in component_values):
-                    continue
-                if validation["severity"] and not any(str(x).rsplit("#", 1)[-1] == validation["severity"] for x in severity_values):
-                    continue
-                if validation["message"]:
-                    expected_messages = [part.strip() for part in validation["message"].split(" | ") if part.strip()]
-                    if not any(str(x) in expected_messages for x in message_values):
-                        continue
-                paths = list(graph.objects(candidate, URIRef(SH + "resultPath")))
-                for path_node in paths:
-                    expression = _rdf_path_expression(graph, path_node)
-                    if not expression.startswith("<percorso SHACL complesso non risolto>"):
-                        return "complex_resolved", expression
-        except Exception:
-            pass
-    return "complex_unresolved", "<percorso SHACL complesso non risolto>"
+    if isinstance(result_path, URIRef):
+        return "simple_iri", _short_iri(str(result_path))
+    if isinstance(result_path, BNode):
+        expression = _rdf_path_expression(graph, result_path)
+        if expression == "<percorso SHACL complesso non risolto>":
+            return "complex_unresolved", expression
+        return "complex_resolved", expression
+    return "unclassified", "<percorso non classificabile>"
 
 
-def analyze_database(db_path: Path, output_dir: Path) -> dict[str, Any]:
+def _local_name(term) -> str | None:
+    if term is None:
+        return None
+    value = str(term)
+    return value.rsplit("#", 1)[-1].rsplit("/", 1)[-1]
+
+
+def _extract_result_rows(validation, graph) -> list[dict[str, Any]]:
+    """Build transient analysis records from a complete report graph.
+
+    No ValidationResult is persisted in SQLite: this conversion exists only in
+    memory while a report is analysed.
+    """
+    from rdflib import RDF
+    from rdflib.namespace import SH
+
+    rows: list[dict[str, Any]] = []
+    nodes = graph.subjects(RDF.type, SH.ValidationResult)
+    for node in nodes:
+        severities = list(graph.objects(node, SH.resultSeverity))
+        severity = _local_name(severities[0]) if severities else None
+        if severity not in {"Violation", "Warning", "Info"}:
+            continue
+        paths = list(graph.objects(node, SH.resultPath))
+        path_type, path_label = _resolve_path(graph, paths[0] if paths else None)
+        components = list(graph.objects(node, SH.sourceConstraintComponent))
+        rows.append({
+            "validation_id": validation["id"],
+            "dataset_id": validation["dataset_id"],
+            "shape_model": validation["shape_model"],
+            "severity": severity,
+            "path_type": path_type,
+            "path_label": path_label,
+            "source_constraint_component": _local_name(components[0]) if components else None,
+        })
+    return rows
+
+
+def analyze_database(
+    db_path: Path,
+    output_dir: Path,
+    report_store_path: Path = Path("data/validation-reports"),
+    report_store=None,
+) -> dict[str, Any]:
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -211,25 +203,24 @@ def analyze_database(db_path: Path, output_dir: Path) -> dict[str, Any]:
         validations = conn.execute("""
             SELECT v.id, v.dataset_id, v.validator_url, v.shape_model, v.conforms,
                    v.results, v.violations, v.warnings, v.infos,
-                   v.report_body_gzip, v.report_format
+                   v.report_graph_iri, v.report_format
             FROM validations v
             WHERE v.execution_status='validated' AND v.http_status=200
               AND v.conforms IS NOT NULL AND (v.error IS NULL OR TRIM(v.error)='')
+              AND v.report_status='stored' AND v.report_graph_iri IS NOT NULL
             ORDER BY v.shape_model, v.dataset_id
         """).fetchall()
 
-        # Individual SHACL results. Keep all fields needed for path classification.
-        result_rows = conn.execute("""
-            SELECT v.id AS validation_id, v.dataset_id, v.shape_model,
-                   v.report_body_gzip, v.report_format,
-                   vr.severity, vr.result_path, vr.properties_json,
-                   vr.source_constraint_component, vr.result_node, vr.focus_node,
-                   vr.source_shape, vr.message
-            FROM validation_results vr JOIN validations v ON v.id=vr.validation_id
-            WHERE v.execution_status='validated' AND v.http_status=200
-              AND v.conforms IS NOT NULL AND (v.error IS NULL OR TRIM(v.error)='')
-              AND vr.severity IN ('Violation','Warning','Info')
-        """).fetchall()
+    if report_store is None:
+        from src.report_store import ValidationReportStore
+        report_store = ValidationReportStore(report_store_path, read_only=True)
+
+    # The report remains RDF in Oxigraph. These small dictionaries are transient
+    # analysis inputs, not a second persisted representation of SHACL results.
+    result_rows: list[dict[str, Any]] = []
+    for validation in validations:
+        graph = report_store.get_report_graph(validation["report_graph_iri"])
+        result_rows.extend(_extract_result_rows(validation, graph))
 
     # Summary per profile, including the three mutually exclusive outcome groups.
     summary = defaultdict(lambda: Counter({"validated": 0, "conforming": 0, "violations": 0, "warnings": 0, "infos": 0, "with_violations": 0, "without_violations_with_findings": 0, "no_findings": 0}))
@@ -296,12 +287,12 @@ def analyze_database(db_path: Path, output_dir: Path) -> dict[str, Any]:
     for (level, old, new), values in sorted(grouped.items()):
         transition_summary.append({"level": level, "from_version": old, "to_version": new, **values})
 
-    # Classify property paths; never aggregate generated blank-node labels as properties.
-    graph_cache: dict[int, Any] = {}
+    # Classify paths from the RDF graph itself; blank-node identifiers are never
+    # treated as properties or compared across reports.
     path_groups = defaultdict(lambda: {"occurrences": 0, "datasets": set()})
     component_groups = defaultdict(lambda: {"occurrences": 0, "datasets": set()})
     for row in result_rows:
-        path_type, path_label = _resolve_path(row, row["result_path"], row["properties_json"], graph_cache)
+        path_type, path_label = row["path_type"], row["path_label"]
         severity = row["severity"]
         path_groups[(row["shape_model"], severity, path_type, path_label)]["occurrences"] += 1
         path_groups[(row["shape_model"], severity, path_type, path_label)]["datasets"].add(row["dataset_id"])
@@ -338,9 +329,8 @@ def analyze_database(db_path: Path, output_dir: Path) -> dict[str, Any]:
     for row in result_rows:
         if row["severity"] != "Violation":
             continue
-        ptype, label = _resolve_path(row, row["result_path"], row["properties_json"], graph_cache)
-        if ptype == "simple_iri":
-            property_dataset_sets.setdefault(label, set()).add(row["dataset_id"])
+        if row["path_type"] == "simple_iri":
+            property_dataset_sets.setdefault(row["path_label"], set()).add(row["dataset_id"])
     property_records = [{"property": name, "occurrences": count,
         "affected_datasets": len(property_dataset_sets.get(name, set()))}
         for name, count in property_aggregate.most_common()]
@@ -454,11 +444,12 @@ def analyze_database(db_path: Path, output_dir: Path) -> dict[str, Any]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Analisi descrittiva read-only del database MQA")
+    parser = argparse.ArgumentParser(description="Analisi descrittiva read-only di SQLite e dei report MQA in PyOxigraph")
     parser.add_argument("--db", type=Path, default=Path("analysis.db"), help="Percorso di analysis.db")
+    parser.add_argument("--store", type=Path, default=Path("data/validation-reports"), help="Percorso del triplestore PyOxigraph")
     parser.add_argument("--out", type=Path, default=Path("analysis-output"), help="Directory output CSV/PNG")
     args = parser.parse_args()
-    for key, value in analyze_database(args.db, args.out).items():
+    for key, value in analyze_database(args.db, args.out, args.store).items():
         print(f"{key}: {value}")
 
 

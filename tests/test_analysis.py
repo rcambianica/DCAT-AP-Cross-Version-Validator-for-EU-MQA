@@ -1,10 +1,36 @@
-import json
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
+from rdflib import BNode, Graph, Literal, Namespace, URIRef
+from rdflib.namespace import RDF
+
 from src.analysis import analyze_database, parse_shape_model
+from src.validator import SH
+
+
+class FakeReportStore:
+    def __init__(self, graphs):
+        self.graphs = graphs
+
+    def get_report_graph(self, graph_iri):
+        return self.graphs[graph_iri]
+
+
+def make_report(path: str) -> Graph:
+    graph = Graph()
+    ex = Namespace("https://example.org/")
+    result = BNode()
+    graph.add((ex.report, RDF.type, SH.ValidationReport))
+    graph.add((ex.report, SH.conforms, Literal(False)))
+    graph.add((result, RDF.type, SH.ValidationResult))
+    graph.add((result, SH.resultSeverity, SH.Violation))
+    graph.add((result, SH.resultPath, URIRef(path)))
+    graph.add((result, SH.sourceConstraintComponent, SH.MinCountConstraintComponent))
+    graph.add((result, SH.focusNode, ex.dataset))
+    graph.add((result, SH.resultMessage, Literal("missing title")))
+    return graph
 
 
 class AnalysisTests(unittest.TestCase):
@@ -14,7 +40,7 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(parse_shape_model("dcatap121level1"), ("1.2.1", "level1"))
         self.assertIsNone(parse_shape_model("dcatap300orig"))
 
-    def test_analysis_outputs_five_charts_and_paired_csv(self):
+    def test_analysis_reads_named_report_graphs_and_outputs_five_charts(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             db = root / "test.db"
@@ -26,33 +52,27 @@ class AnalysisTests(unittest.TestCase):
                     shape_model TEXT, conforms INTEGER, results INTEGER,
                     violations INTEGER, warnings INTEGER, infos INTEGER,
                     http_status INTEGER, error TEXT, execution_status TEXT,
-                    report_body_gzip BLOB, report_format TEXT
-                );
-                CREATE TABLE validation_results(
-                    id INTEGER PRIMARY KEY, validation_id INTEGER, result_node TEXT,
-                    focus_node TEXT, result_path TEXT, value TEXT, source_shape TEXT,
-                    source_constraint_component TEXT, severity TEXT, message TEXT,
-                    properties_json TEXT
+                    report_graph_iri TEXT, report_status TEXT, report_format TEXT
                 );
                 INSERT INTO datasets VALUES ('ds1','ok');
                 INSERT INTO validations VALUES
-                    (1,'ds1','http://validator','dcatap211level1',0,1,1,0,0,200,NULL,'validated',NULL,'turtle'),
-                    (2,'ds1','http://validator','dcatap300level1',0,2,2,0,0,200,NULL,'validated',NULL,'turtle');
-                INSERT INTO validation_results VALUES
-                    (1,1,'r1','urn:focus','http://purl.org/dc/terms/title',NULL,'s1','MinCountConstraintComponent','Violation','missing title',
-                     '{"http://www.w3.org/ns/shacl#resultPath":[{"term_type":"uri","value":"http://purl.org/dc/terms/title"}]}');
-                INSERT INTO validation_results VALUES
-                    (2,2,'r2','urn:focus','http://purl.org/dc/terms/title',NULL,'s1','MinCountConstraintComponent','Violation','missing title',
-                     '{"http://www.w3.org/ns/shacl#resultPath":[{"term_type":"uri","value":"http://purl.org/dc/terms/title"}]}');
+                    (1,'ds1','http://validator','dcatap211level1',0,1,1,0,0,200,NULL,'validated','urn:report:1','stored','turtle'),
+                    (2,'ds1','http://validator','dcatap300level1',0,1,1,0,0,200,NULL,'validated','urn:report:2','stored','turtle');
             """)
             conn.commit()
             conn.close()
 
+            report_store = FakeReportStore({
+                "urn:report:1": make_report("http://purl.org/dc/terms/title"),
+                "urn:report:2": make_report("http://purl.org/dc/terms/title"),
+            })
             out = root / "out"
-            summary = analyze_database(db, out)
+            summary = analyze_database(db, out, report_store=report_store)
             self.assertEqual(summary["successful_validation_rows"], 2)
             self.assertEqual(summary["paired_comparisons"], 1)
+            self.assertEqual(summary["shacl_result_rows"], 2)
             self.assertEqual(summary["charts_generated"], 5)
+            self.assertEqual(summary["path_categories"], {"simple_iri": 2})
             for name in (
                 "validation_outcomes.png", "shacl_result_distributions.png",
                 "paired_version_changes.png", "shacl_component_heatmap.png",

@@ -1,0 +1,16 @@
+PREFIX mqa: <urn:mqa:vocab:>
+PREFIX sh:  <http://www.w3.org/ns/shacl#>
+
+SELECT ?shapeModel (COUNT(DISTINCT ?result) AS ?violations)
+WHERE {
+  GRAPH <urn:mqa:validation-catalog> {
+    ?report a mqa:ValidationReport ;
+            mqa:shapeModel ?shapeModel .
+  }
+  GRAPH ?report {
+    ?result a sh:ValidationResult ;
+            sh:resultSeverity sh:Violation .
+  }
+}
+GROUP BY ?shapeModel
+ORDER BY DESC(?violations)

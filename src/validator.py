@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import json
 import time
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
 
 import requests
 from requests.adapters import HTTPAdapter
-from rdflib import BNode, Graph, Literal, Namespace, URIRef
+from rdflib import Graph, Namespace
 from rdflib.namespace import RDF
 from urllib3.util.retry import Retry
 
@@ -27,85 +25,7 @@ class ValidationResult:
     report_body: bytes | None = None
     report_content_type: str | None = None
     report_parsed: bool = False
-    validation_details: list[dict[str, Any]] = field(default_factory=list)
-
-
-def _term_record(term: Any) -> dict[str, Any]:
-    """Serialize an RDF term without discarding datatype/language information."""
-    if isinstance(term, URIRef):
-        term_type = "uri"
-    elif isinstance(term, BNode):
-        term_type = "bnode"
-    elif isinstance(term, Literal):
-        term_type = "literal"
-    else:
-        term_type = type(term).__name__
-    return {
-        "term_type": term_type,
-        "value": str(term),
-        "n3": term.n3(),
-        "datatype": str(term.datatype) if isinstance(term, Literal) and term.datatype else None,
-        "language": term.language if isinstance(term, Literal) else None,
-    }
-
-
-def _term_text(graph: Graph, subject: Any, predicate: URIRef) -> str | None:
-    values = sorted(graph.objects(subject, predicate), key=lambda value: value.n3())
-    return str(values[0]) if values else None
-
-
-def _local_name(value: str | None) -> str | None:
-    if not value:
-        return None
-    return value.rsplit("#", 1)[-1].rsplit("/", 1)[-1]
-
-
-def _properties_for_subject(graph: Graph, subject: Any) -> dict[str, list[dict[str, Any]]]:
-    properties: dict[str, list[dict[str, Any]]] = {}
-    for predicate, obj in graph.predicate_objects(subject):
-        properties.setdefault(str(predicate), []).append(_term_record(obj))
-    for values in properties.values():
-        values.sort(key=lambda item: (item["n3"], item.get("language") or "", item.get("datatype") or ""))
-    return dict(sorted(properties.items()))
-
-
-def _extract_report_data(graph: Graph) -> list[dict[str, Any]]:
-    """Extract every sh:ValidationResult and its direct RDF properties.
-
-    The original RDF body is retained as a compressed BLOB in SQLite. The JSON
-    representation is a queryable index for properties not covered by columns.
-    """
-    result_nodes = set(graph.subjects(RDF.type, SH.ValidationResult))
-    details: list[dict[str, Any]] = []
-    for node in result_nodes:
-        properties = _properties_for_subject(graph, node)
-        focus = _term_text(graph, node, SH.focusNode)
-        path = _term_text(graph, node, SH.resultPath)
-        value = _term_text(graph, node, SH.value)
-        source_shape = _term_text(graph, node, SH.sourceShape)
-        component = _term_text(graph, node, SH.sourceConstraintComponent)
-        severity_iri = _term_text(graph, node, SH.resultSeverity)
-        messages = sorted(str(item) for item in graph.objects(node, SH.resultMessage))
-        details.append({
-            "result_node": str(node),
-            "focus_node": focus,
-            "result_path": path,
-            "value": value,
-            "source_shape": source_shape,
-            "source_constraint_component": _local_name(component),
-            "severity": _local_name(severity_iri),
-            "message": " | ".join(messages) if messages else None,
-            "properties_json": json.dumps(properties, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-        })
-
-    # RDF graphs are unordered: sort results by semantic content for stable
-    # persistence and output ordering across equivalent reports.
-    stable_fields = (
-        "focus_node", "result_path", "severity", "source_constraint_component",
-        "value", "source_shape", "message", "properties_json",
-    )
-    details.sort(key=lambda item: tuple(item.get(field) or "" for field in stable_fields))
-    return details
+    report_format: str | None = None
 
 
 class ShaclValidatorClient:
@@ -141,7 +61,7 @@ class ShaclValidatorClient:
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
 
-    def _parse_report(self, response: requests.Response) -> Graph:
+    def _parse_report(self, response: requests.Response) -> tuple[Graph, str]:
         content_type = response.headers.get("Content-Type", "").lower()
         candidates: list[str] = []
 
@@ -153,12 +73,12 @@ class ShaclValidatorClient:
             candidates.append("xml")
         elif "n-triples" in content_type:
             candidates.append("nt")
-        elif "trig" in content_type:
-            candidates.append("trig")
         elif "n3" in content_type:
             candidates.append("n3")
 
-        for fmt in ("turtle", "json-ld", "xml", "nt", "trig", "n3"):
+        # SHACL validation reports are RDF graphs. Dataset serializations such
+        # as TriG/N-Quads are intentionally not accepted by this pipeline.
+        for fmt in ("turtle", "json-ld", "xml", "nt", "n3"):
             if fmt not in candidates:
                 candidates.append(fmt)
 
@@ -167,7 +87,7 @@ class ShaclValidatorClient:
             try:
                 graph = Graph()
                 graph.parse(data=response.content, format=fmt)
-                return graph
+                return graph, fmt
             except Exception as exc:
                 last_error = exc
 
@@ -209,7 +129,7 @@ class ShaclValidatorClient:
             )
 
         try:
-            graph = self._parse_report(response)
+            graph, report_format = self._parse_report(response)
         except Exception as exc:
             return ValidationResult(
                 shape_model,
@@ -240,8 +160,6 @@ class ShaclValidatorClient:
             if SH.Info in severities:
                 infos += 1
 
-        validation_details = _extract_report_data(graph)
-
         return ValidationResult(
             shape_model=shape_model,
             conforms=conforms,
@@ -253,5 +171,5 @@ class ShaclValidatorClient:
             report_body=response.content or None,
             report_content_type=response.headers.get("Content-Type"),
             report_parsed=True,
-            validation_details=validation_details,
+            report_format=report_format,
         )

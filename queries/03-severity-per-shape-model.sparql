@@ -1,0 +1,16 @@
+PREFIX mqa: <urn:mqa:vocab:>
+PREFIX sh:  <http://www.w3.org/ns/shacl#>
+
+SELECT ?shapeModel ?severity (COUNT(DISTINCT ?result) AS ?results)
+WHERE {
+  GRAPH <urn:mqa:validation-catalog> {
+    ?report a mqa:ValidationReport ;
+            mqa:shapeModel ?shapeModel .
+  }
+  GRAPH ?report {
+    ?result a sh:ValidationResult ;
+            sh:resultSeverity ?severity .
+  }
+}
+GROUP BY ?shapeModel ?severity
+ORDER BY ?shapeModel ?severity

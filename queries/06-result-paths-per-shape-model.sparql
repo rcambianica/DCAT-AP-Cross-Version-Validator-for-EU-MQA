@@ -1,0 +1,16 @@
+PREFIX mqa: <urn:mqa:vocab:>
+PREFIX sh:  <http://www.w3.org/ns/shacl#>
+
+SELECT ?shapeModel ?path (COUNT(DISTINCT ?result) AS ?occurrences)
+WHERE {
+  GRAPH <urn:mqa:validation-catalog> {
+    ?report a mqa:ValidationReport ;
+            mqa:shapeModel ?shapeModel .
+  }
+  GRAPH ?report {
+    ?result a sh:ValidationResult ;
+            sh:resultPath ?path .
+  }
+}
+GROUP BY ?shapeModel ?path
+ORDER BY ?shapeModel DESC(?occurrences)

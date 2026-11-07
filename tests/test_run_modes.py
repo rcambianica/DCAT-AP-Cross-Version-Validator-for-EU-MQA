@@ -9,11 +9,28 @@ from src.db import Database
 
 VALIDATOR_URL = "http://localhost:8080/shacl/validation/report"
 PROFILES = ["dcatap301level1", "dcatap301level2"]
+REPORT = b'''@prefix sh: <http://www.w3.org/ns/shacl#> .
+[] a sh:ValidationReport ; sh:conforms false .'''
+
+
+class FakeReportStore:
+    read_only = False
+
+    def __init__(self):
+        self.graphs = {}
+        self.metadata = {}
+
+    def save_report_metadata(self, graph_iri, **metadata):
+        self.metadata[graph_iri] = metadata
+
+    def save_report(self, graph_iri, body, rdf_format):
+        self.graphs[graph_iri] = body
+        return 1
 
 
 class RunModeTests(unittest.TestCase):
     def _database_with_skipped_profile(self, root: Path) -> Database:
-        db = Database(root / "analysis.db")
+        db = Database(root / "analysis.db", report_store=FakeReportStore())
         db.init_schema()
         with db.get_connection() as conn:
             conn.execute(
@@ -27,7 +44,8 @@ class RunModeTests(unittest.TestCase):
             dataset_id="dataset-1", validator_url=VALIDATOR_URL,
             shape_model=PROFILES[0], conforms=False, results=1, violations=1,
             warnings=0, infos=0, http_status=200, error=None,
-            execution_status="validated",
+            execution_status="validated", report_body=REPORT,
+            report_content_type="text/turtle", report_parsed=True, report_format="turtle",
         )
         db.save_validation_result(
             dataset_id="dataset-1", validator_url=VALIDATOR_URL,
