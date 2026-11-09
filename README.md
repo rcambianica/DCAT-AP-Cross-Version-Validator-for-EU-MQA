@@ -4,7 +4,7 @@ Strumento Python per la validazione cross-version dei metadati DCAT-AP dei datas
 data.europa.eu. Le validazioni vengono eseguite tramite il validatore SHACL locale di EU MQA (`validating-shacl`); questo progetto ne
 orchestra le richieste e raccoglie i risultati.
 
-La pipeline è composta da **tre operazioni indipendenti**, eseguite tramite tre comandi CLI distinti:
+La pipeline separa **discovery, acquisizione RDF e validazione SHACL** in fasi indipendenti, esposte attraverso domini e sottocomandi della stessa CLI gerarchica:
 
 ```text
                  data.europa.eu / piveau Hub
@@ -37,7 +37,7 @@ locale di `validating-shacl`.
 
 ## Requisiti
 
-- Python 3.11+
+- Python 3.10+
 - accesso Internet verso `data.europa.eu` per discovery e fetch
 - un'istanza locale di `validating-shacl` (disponibile su https://gitlab.com/dataeuropa/mqa/validating-shacl) raggiungibile sulla porta
   configurata
@@ -51,7 +51,29 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-L’installazione crea il comando `dcat-ap-cv`. In alternativa, dalla directory del progetto è possibile eseguire i comandi tramite `python -m src.cli`.
+L’installazione crea il comando `dcat-ap-cv`. In alternativa, dalla directory del progetto è possibile usare `python -m src`: entrambi gli entry point invocano la stessa CLI gerarchica. I moduli applicativi non espongono CLI indipendenti.
+
+## CLI gerarchica
+
+Tutte le funzionalità condividono la grammatica `dcat-ap-cv <dominio> <comando> [opzioni]`. I domini separano le responsabilità operative: `catalogue` per Hub Search, `datasets` per l'acquisizione RDF, `validation` per l'esecuzione SHACL, `reports` per la consultazione dei report, `query` per SPARQL e `analysis` per le elaborazioni quantitative e qualitative. Ogni dominio richiede un sottocomando esplicito.
+
+I sottocomandi disponibili sono `catalogue categories`, `catalogue discover`, `datasets fetch`, `validation run`, `reports show`, `query sparql` e `analysis quantitative|qualitative|all`. Non sono previsti comandi piatti alternativi né un entry point separato per l'analisi.
+
+## Moduli Python
+
+| Modulo | Responsabilità |
+|---|---|
+| `src/__main__.py` | Delega a `src.cli.main()` per l'entry point `python -m src`. |
+| `src/cli.py` | Definisce la gerarchia CLI e coordina discovery, fetch, validazione, consultazione dei report, query e analisi. |
+| `src/config.py` | Centralizza endpoint, timeout, percorsi e override tramite variabili d'ambiente. |
+| `src/hub.py` | Incapsula le chiamate a Hub Search e Hub Repo. |
+| `src/profiles.py` | Scopre e filtra gli `shapeModel` dal file OpenAPI locale e costruisce l'ordine di validazione. |
+| `src/validator.py` | Chiama il validator SHACL locale e interpreta la risposta, preservando il payload RDF del report. |
+| `src/db.py` | Gestisce inventario e metadati operativi in SQLite e coordina la persistenza recuperabile dei report. |
+| `src/report_store.py` | Gestisce i named graph PyOxigraph, il catalogo RDF dei report e le query/serializzazioni. |
+| `src/analysis.py` | Implementa l'analisi quantitativa su SQLite e l'estrazione/aggregazione qualitativa da PyOxigraph. Espone `load_qualitative_results()` per i moduli analitici downstream. |
+
+I moduli di dominio non definiscono parser CLI autonomi. Le responsabilità di HTTP, profili, validazione e persistenza restano separate dall'orchestrazione in `cli.py`.
 
 ## Comandi
 
@@ -64,7 +86,7 @@ passare all'API.
 Elenca le categorie disponibili:
 
 ```bash
-dcat-ap-cv categories
+dcat-ap-cv catalogue categories
 ```
 
 Esempio di output:
@@ -79,26 +101,26 @@ ECON     5981            Economia e finanze
 Esegui discovery sull'intero catalogo: l'endpoint `/search/datasets` restituisce l'elenco degli ID in una singola richiesta.
 
 ```bash
-dcat-ap-cv discover
+dcat-ap-cv catalogue discover
 ```
 
 Esegui discovery per una categoria oppure per più categorie. Puoi indicare l'ID o l'etichetta restituita dall'API; le opzioni `--category` sono ripetibili e accettano anche una lista separata da virgole.
 
 ```bash
-dcat-ap-cv discover --category ENVI
+dcat-ap-cv catalogue discover --category ENVI
 # equivalente, se l'etichetta è restituita dall'API:
-dcat-ap-cv discover --category Ambiente
+dcat-ap-cv catalogue discover --category Ambiente
 
 # più categorie
-dcat-ap-cv discover --category ENVI --category ECON
+dcat-ap-cv catalogue discover --category ENVI --category ECON
 # forma equivalente
-dcat-ap-cv discover --category ENVI,ECON
+dcat-ap-cv catalogue discover --category ENVI,ECON
 ```
 
 Per limitare il numero di dataset in un test:
 
 ```bash
-dcat-ap-cv discover --category ENVI --limit 20
+dcat-ap-cv catalogue discover --category ENVI --limit 20
 ```
 
 Con una o più categorie, MQA invia una richiesta iniziale a `/search/search` con la facet `categories` e `scroll=true`, quindi recupera i batch successivi tramite `/scroll`. Non usa la paginazione ordinaria con `page` e non supera il limite API di 1000 risultati per risposta. I risultati delle categorie vengono uniti e deduplicati; `--limit`, se specificato, limita il totale raccolto.
@@ -113,13 +135,13 @@ Scarica esclusivamente i dataset presenti nell'inventario locale che non sono an
 precedente.
 
 ```bash
-python -m src.cli fetch --limit 10
+dcat-ap-cv datasets fetch --limit 10
 ```
 
 Senza `--limit` vengono elaborati tutti i dataset attualmente in coda:
 
 ```bash
-python -m src.cli fetch
+dcat-ap-cv datasets fetch
 ```
 
 `fetch` non esegue discovery e non esegue validazioni.
@@ -137,19 +159,19 @@ data/rdf/
 Valida esclusivamente i dataset RDF già scaricati tramite il validator SHACL locale.
 
 ```bash
-python -m src.cli run --limit 10
+dcat-ap-cv validation run --limit 10
 ```
 
 Senza `--limit` vengono elaborati tutti i dataset con RDF disponibile e una matrice di validazione ancora incompleta:
 
 ```bash
-python -m src.cli run
+dcat-ap-cv validation run
 ```
 
 Per impostazione predefinita, `run` valida **tutti i profili dichiarati dal validator**, anche quando un livello precedente restituisce `conforms=false`. Per attivare opzionalmente lo short-circuit:
 
 ```bash
-python -m src.cli run --short-circuit
+dcat-ap-cv validation run --short-circuit
 ```
 
 Con `--short-circuit`, all'interno delle catene Level 1 → Level 2 → Level 3 → profilo completo, i livelli successivi vengono registrati come `skipped` dopo il primo risultato non conforme. La modalità completa predefinita considera invece tali record `skipped` come ancora da validare, così un dataset già elaborato con lo short-circuit viene ripreso ed eseguito su tutti i profili.
@@ -219,15 +241,15 @@ Il principio è quello della metodologia MQA:
 - Level 1 = Base;
 - Level 2 = Base + vocabolari;
 - Level 3 = Base + vocabolari + proprietà raccomandate;
-- nessun livello = Base + vocabolari + proprietà raccomandate + ranges.
+- All shapes (profilo senza suffisso `levelN`) = Base + vocabolari + proprietà raccomandate + ranges.
 
-Perciò, se ad esempio:
+Solo quando viene specificato `--short-circuit`, se ad esempio:
 
 ```text
 dcatap301level1 -> conforms=false
 ```
 
-non vengono eseguite:
+non vengono eseguite le validazioni successive della stessa catena:
 
 ```text
 dcatap301level2
@@ -235,14 +257,13 @@ dcatap301level3
 dcatap301
 ```
 
-Nel database vengono comunque registrate come `skipped`, con la motivazione e il profilo che ha bloccato la catena.
+Nel database vengono comunque registrate come `skipped`, con la motivazione e il profilo che ha bloccato la catena. Senza `--short-circuit`, tutti i profili vengono eseguiti indipendentemente dall'esito dei livelli precedenti.
 
 Se invece Level 1 restituisce un errore tecnico (HTTP diverso da 200, timeout, report RDF non interpretabile, ecc.), il profilo viene
 registrato come `error` e **non** viene considerato equivalente a `conforms=false`. La catena resta quindi incompleta e sarà ritentata in
 una successiva esecuzione.
 
-Le versioni senza Level 1/2/3, come i profili storici `orig` o `conventions`, vengono trattate come catene indipendenti e non vengono
-collegate artificialmente alle altre.
+I profili senza suffisso `levelN` vengono trattati come configurazioni complete e associati alla catena che condivide lo stesso prefisso. I profili contenenti `orig` e quelli tedeschi vengono invece esclusi durante la discovery locale; non entrano nel piano di validazione.
 
 ## Persistenza: SQLite e PyOxigraph
 
@@ -347,26 +368,26 @@ GROUP BY ?shapeModel
 ORDER BY ?shapeModel
 ```
 
-Le query pronte sono disponibili nella directory `queries/`:
+Le query pronte sono disponibili nella directory `queries/SPARQL/`:
 
-- `01-reports-per-shape-model.sparql`: numero di report per modello;
-- `02-results-per-shape-model.sparql`: numero totale di `sh:ValidationResult`;
-- `03-severity-per-shape-model.sparql`: distribuzione per severità;
-- `04-violations-per-shape-model.sparql`: sole `sh:Violation`;
-- `05-constraint-components-per-shape-model.sparql`: risultati per componente SHACL;
-- `06-result-paths-per-shape-model.sparql`: risultati per `sh:resultPath`;
-- `07-reports-for-shape-model.sparql`: elenco report e metadati per un modello (sostituire il literal di esempio).
+- `queries/SPARQL/01-reports-per-shape-model.sparql`: numero di report per modello;
+- `queries/SPARQL/02-results-per-shape-model.sparql`: numero totale di `sh:ValidationResult`;
+- `queries/SPARQL/03-severity-per-shape-model.sparql`: distribuzione per severità;
+- `queries/SPARQL/04-violations-per-shape-model.sparql`: sole `sh:Violation`;
+- `queries/SPARQL/05-constraint-components-per-shape-model.sparql`: risultati per componente SHACL;
+- `queries/SPARQL/06-result-paths-per-shape-model.sparql`: risultati per `sh:resultPath`;
+- `queries/SPARQL/07-reports-for-shape-model.sparql`: elenco report e metadati per un modello (sostituire il literal di esempio).
 
 Le query possono essere eseguite direttamente tramite `ValidationReportStore.query()` oppure tramite un endpoint SPARQL collegato allo stesso store. I percorsi SHACL complessi e i blank node di `sh:resultPath` non devono essere interpretati come identificatori stabili tra report differenti.
 
-È disponibile anche il comando CLI `sparql`, che apre il triplestore in sola lettura ed esegue query `SELECT` o `ASK` senza modificare SQLite:
+È disponibile il sottocomando `query sparql`, che apre il triplestore in sola lettura ed esegue query `SELECT` o `ASK` senza modificare SQLite:
 
 ```bash
 # Esegue una query salvata nel repository
-python -m src.cli sparql --query-file queries/04-violations-per-shape-model.sparql
+dcat-ap-cv query sparql --query-file queries/SPARQL/04-violations-per-shape-model.sparql
 
 # Query inline, output JSON
-python -m src.cli sparql --format json --query \
+dcat-ap-cv query sparql --format json --query \
   'PREFIX mqa: <urn:mqa:vocab:> SELECT ?report WHERE { GRAPH <urn:mqa:validation-catalog> { ?report mqa:shapeModel "dcatap301level1" } }'
 ```
 
@@ -385,19 +406,19 @@ Una validazione è considerata completata dalla coda incrementale soltanto se è
 
 Se viene ripetuta la validazione della stessa combinazione dataset/validator/profilo, il record SQLite viene aggiornato e il nuovo report viene memorizzato con un IRI basato sul suo hash. Dopo che il nuovo grafo e i relativi metadati sono stati registrati, il precedente grafo non più referenziato e la sua voce nel catalogo vengono rimossi.
 
-### Comando `reports`
+### Sottocomando `reports show`
 
-Il comando `reports` recupera i metadati da SQLite e i singoli risultati direttamente dal named graph Oxigraph; l'output JSON è costruito al momento e non viene persistito:
+Il sottocomando `reports show` recupera i metadati da SQLite e i singoli risultati direttamente dal named graph Oxigraph; l'output JSON è costruito al momento e non viene persistito:
 
 ```bash
 # Risultati di un dataset e di uno specifico profilo
-python -m src.cli reports --dataset-id ID_DATASET --profile dcatap301level1
+dcat-ap-cv reports show --dataset-id ID_DATASET --profile dcatap301level1
 
 # Solo violation di un profilo
-python -m src.cli reports --profile dcatap301level1 --severity Violation --limit 200
+dcat-ap-cv reports show --profile dcatap301level1 --severity Violation --limit 200
 
 # Serializza il grafo conservato su stdout
-python -m src.cli reports --dataset-id ID_DATASET --profile dcatap301level1 --raw-report
+dcat-ap-cv reports show --dataset-id ID_DATASET --profile dcatap301level1 --raw-report
 ```
 
 `--raw-report` richiede `--dataset-id` e `--profile`. Il report viene serializzato dal triplestore nel formato registrato in `report_format`: non è una copia byte per byte della risposta HTTP originale. Il checksum dei byte originali è disponibile in `report_sha256`.
@@ -488,12 +509,12 @@ versione effettivamente installata sulla macchina locale resta quella da verific
 
 ## Esecuzione tipica
 
-Le tre fasi sono completamente separate:
+Le fasi operative sono completamente separate:
 
 ```bash
-dcat-ap-cv discover
-dcat-ap-cv fetch --limit 100
-dcat-ap-cv run --limit 100
+dcat-ap-cv catalogue discover
+dcat-ap-cv datasets fetch --limit 100
+dcat-ap-cv validation run --limit 100
 ```
 
 È quindi possibile interrompere una fase e riprenderla successivamente senza ripetere le altre.
@@ -525,62 +546,101 @@ il RDF di ciascun dataset dall'Hub Repo, mentre `run` sottopone lo stesso RDF al
 dichiarati dal suo OpenAPI.
 
 
-## Analisi statistica del database
+## Analisi quantitativa e qualitativa
 
-Il modulo `src.analysis` legge `analysis.db` e il triplestore PyOxigraph in sola lettura e produce cinque grafici PNG e tabelle CSV. Non modifica gli archivi e considera soltanto le validazioni concluse con `execution_status='validated'`, HTTP 200, `conforms` valorizzato, nessun errore e report effettivamente presente nel triplestore. Le righe `skipped`, `error` e le risposte non interpretabili sono escluse dalle analisi degli esiti; non vengono mai riclassificate come non conformità. I singoli risultati SHACL vengono estratti dai report in memoria durante l'analisi, senza essere ripersistiti in SQLite.
+L'analisi è esposta esclusivamente tramite il dominio CLI `analysis`. I due rami hanno sorgenti indipendenti:
 
-Dipendenze (già incluse nell'installazione del progetto): `matplotlib` e `numpy`.
+- **Quantitativa — SQLite.** Legge inventario, stato di fetch, stato delle esecuzioni e conteggi aggregati delle validazioni. Include solo le validazioni con `execution_status='validated'`, HTTP 200, `conforms` valorizzato e nessun errore. Non usa i singoli `sh:ValidationResult` come fonte quantitativa e non modifica il database.
+- **Qualitativa — PyOxigraph.** Legge il catalogo RDF e i named graph dei report SHACL. Estrae i singoli `sh:ValidationResult` in memoria e genera CSV aggregati. Non legge SQLite e non modifica il triplestore.
 
-```bash
-python -m src.analysis
-```
-
-È possibile specificare il database, il triplestore e la directory di destinazione:
+Esecuzione di entrambe le analisi:
 
 ```bash
-python -m src.analysis \
-    --db /percorso/analysis.db \
-    --store /percorso/validation-reports \
-    --out risultati-analisi
+dcat-ap-cv analysis all
 ```
 
-### Grafici generati
+Solo analisi quantitativa, con filtro sul catalogo e senza grafici:
 
-1. **`validation_outcomes.png` — Distribuzione degli esiti per shape model.** Barre sovrapposte al 100% con tre categorie mutuamente esclusive: nessun risultato SHACL; risultati senza violation (warning e/o info); almeno una violation. La categoria con violation può contenere anche warning e info. La percentuale di conformità rimane disponibile nel CSV, ma non è l'unica misura mostrata: in campioni con conformità rara la distribuzione dei risultati è più informativa.
-2. **`shacl_result_distributions.png` — Distribuzione di violation e warning per dataset.** Due boxplot separati mostrano la dispersione dei conteggi per validazione e shape model. I dati individuali sono conservati in `validation_distribution.csv`.
-3. **`paired_version_changes.png` — Variazione appaiata dei risultati tra versioni.** Per ogni dataset presente in entrambe le configurazioni, confronta i conteggi di violation e warning tra versioni DCAT-AP consecutive, mantenendo costante il livello (`base`, `level1`, `level2` o `level3`). Il grafico conta i dataset per cui il numero di risultati aumenta, diminuisce o rimane invariato. I confronti sono possibili solo per coppie effettivamente disponibili e concluse.
-4. **`shacl_component_heatmap.png` — Prevalenza delle componenti SHACL.** Due heatmap (Violation e Warning) riportano, per ogni componente e shape model, la percentuale di dataset validati interessati da almeno un risultato della componente. Il CSV include anche il numero assoluto di occorrenze e di dataset coinvolti.
-5. **`rdf_property_violations.png` — Proprietà RDF maggiormente coinvolte.** Mostra le prime 15 proprietà IRI dirette, ordinate per numero di dataset distinti con almeno una violation. Non confonde il numero di occorrenze con la diffusione del problema tra dataset.
+```bash
+dcat-ap-cv analysis quantitative \
+  --db /percorso/analysis.db \
+  --catalogue dati-gov-it \
+  --category INTR \
+  --no-charts \
+  --out risultati-analisi
+```
 
-### CSV prodotti
+Solo analisi qualitativa, limitata a un modello e a una severità:
 
-- `profile_summary.csv`: numero di validazioni concluse, conformità, conteggi di violation/warning/info e distribuzione percentuale delle tre categorie di esito.
-- `validation_distribution.csv`: conteggi individuali per dataset e shape model, base per boxplot e ulteriori statistiche descrittive.
-- `paired_version_deltas.csv`: variazioni individuali dei conteggi tra coppie di versioni allo stesso livello.
-- `paired_version_summary.csv`: numero di dataset con conteggi aumentati, diminuiti o invariati per livello e coppia di versioni.
-- `shacl_components.csv`: occorrenze, dataset interessati e prevalenza per componente SHACL, configurazione e severità.
-- `shacl_paths.csv`: classificazione dei percorsi SHACL, con occorrenze e dataset interessati.
-- `violations_by_rdf_property.csv`: riepilogo delle proprietà RDF dirette coinvolte nelle violation.
+```bash
+dcat-ap-cv analysis qualitative \
+  --store /percorso/validation-reports \
+  --shape-model dcatap301level1 \
+  --severity Violation \
+  --out risultati-analisi
+```
 
-### Classificazione dei percorsi SHACL
+I percorsi predefiniti sono `analysis.db` e `data/validation-reports/`. Possono essere sovrascritti rispettivamente con `--db` e `--store`, oppure tramite `MQA_DB_PATH` e `MQA_REPORT_STORE_PATH`. La directory di output predefinita è `analysis-output/`. Il comando `analysis all` salva i risultati dei due rami in sottodirectory distinte (`quantitative/` e `qualitative/`) e scrive un riepilogo comune in `analysis_summary.json`.
 
-Il valore RDF associato a `sh:resultPath` viene letto direttamente dal report conservato nel triplestore. Non è corretto considerare ogni valore come una proprietà RDF: SHACL consente anche percorsi composti o inversi rappresentati mediante blank node e liste RDF. Inoltre, gli identificatori dei blank node sono locali al documento e non sono categorie semanticamente confrontabili tra report.
+### Output quantitativi
 
-L'analisi applica quindi questa classificazione:
+Il modulo genera i seguenti CSV:
 
-- `simple_iri`: il termine `sh:resultPath` è un IRI. È trattato come proprietà RDF diretta e può comparire nel grafico delle proprietà.
-- `complex_resolved`: il termine è un blank node, ma la sua espressione viene ricostruita dal report RDF originale. Sono supportati percorsi inversi, sequenze, alternative e operatori zero-or-more, one-or-more e zero-or-one.
-- `complex_unresolved`: il termine è un blank node, ma non è possibile ricostruirne l'espressione dal report conservato. È mantenuto come categoria aggregata, mai come identificatore individuale.
-- `missing` e `unclassified`: percorso assente o termine non classificabile.
+- `dataset_fetch_status.csv`: numero di dataset per stato di acquisizione RDF.
+- `validation_execution_status.csv`: conteggio delle righe di validazione per stato operativo, HTTP status ed eventuale errore.
+- `profile_summary.csv`: validazioni, dataset, conformità, conteggi e percentuali di violation, warning e info, statistiche descrittive e distribuzione degli esiti per shape model.
+- `validation_distribution.csv`: conteggi individuali per dataset e shape model.
+- `paired_version_deltas.csv`: variazioni individuali di violation e warning tra versioni adiacenti fra quelle presenti nel campione, a parità di dataset, validator e livello.
+- `paired_version_summary.csv`: numero di dataset con conteggi aumentati, diminuiti o invariati per coppia di versioni disponibili e livello.
 
-Per ricostruire un percorso complesso, l'analisi legge il named graph PyOxigraph associato alla validazione e ne costruisce una vista RDFLib temporanea. Non dipende dagli identificatori dei blank node originali e non richiede una tabella relazionale `validation_results`.
+Con i grafici abilitati e dati disponibili vengono generati fino a quattro PNG:
 
-I percorsi complessi restano disponibili in `shacl_paths.csv`, ma sono esclusi dal ranking delle proprietà RDF dirette. Questo evita di presentare identificatori tecnici o espressioni SHACL come se fossero proprietà semplici.
+1. `validation_outcomes.png`: distribuzione percentuale delle validazioni senza risultati, con risultati non-Violation e con almeno una Violation.
+2. `severity_totals.png`: conteggio complessivo di violation, warning e info per shape model.
+3. `result_distributions.png`: boxplot dei conteggi di violation e warning per validazione e shape model.
+4. `paired_version_changes.png`: variazioni appaiate dei conteggi tra versioni DCAT-AP adiacenti nel campione.
+
+`quantitative_summary.json` registra sorgente, filtri, dimensione del campione, validazioni incluse/escluse, confronti appaiati e grafici generati. `--no-charts` disabilita soltanto la produzione PNG, non i CSV.
+
+Sono disponibili anche query SQL di riferimento in `queries/SQL/`. Usano la stessa condizione di inclusione del ramo quantitativo (`execution_status='validated'`, HTTP 200, `conforms` valorizzato e nessun errore); non richiedono che il report RDF sia presente in Oxigraph, perché i conteggi quantitativi provengono da SQLite.
+
+### Output qualitativi
+
+Il ramo qualitativo genera:
+
+- `qualitative_report_inventory.csv`: report presenti nel catalogo RDF e relativi metadati.
+- `qualitative_results.csv`: una riga per ogni `sh:ValidationResult`, con severità, componente, percorso, messaggio, focus node, valore, shape e constraint sorgente.
+- `qualitative_profile_summary.csv`: risultati aggregati per shape model e severità.
+- `qualitative_components.csv`: frequenza delle componenti SHACL, report e dataset interessati.
+- `qualitative_paths.csv`: frequenza dei percorsi SHACL risolti e classificati.
+- `qualitative_messages.csv`: raggruppamento dei messaggi tramite firma testuale normalizzata.
+- `qualitative_focus_nodes.csv`: frequenza dei focus node.
+- `qualitative_structural_patterns.csv`: aggregazione per componente, tipo/percorso e severità.
+- `qualitative_report_errors.csv`: report presenti nel catalogo ma non leggibili.
+
+`qualitative_summary.json` riporta report selezionati, report letti/non leggibili, shape model, risultati estratti e filtri applicati. `--shape-model` e `--severity` sono ripetibili.
+
+### Percorsi SHACL
+
+Il valore di `sh:resultPath` non è sempre una proprietà RDF semplice. SHACL consente percorsi composti o inversi rappresentati mediante blank node e liste RDF. L'analisi classifica quindi i percorsi come:
+
+- `simple_iri`: percorso costituito da un IRI diretto;
+- `complex_resolved`: percorso complesso ricostruito dal grafo RDF;
+- `complex_unresolved`: percorso complesso non ricostruibile;
+- `missing` o `unclassified`: percorso assente o termine non classificabile.
+
+I blank node vengono interpretati esclusivamente all'interno del report di appartenenza. Le loro etichette non sono identificatori stabili e non vengono usate per creare categorie confrontabili tra report.
+
+### Confine per il clustering semantico
+
+L'estrazione qualitativa espone anche la funzione Python `src.analysis.load_qualitative_results()`. Questa funzione restituisce report, risultati individuali ed eventuali errori di lettura senza scrivere file o modificare Oxigraph. Costituisce il punto di ingresso comune per le elaborazioni successive che operano sui singoli risultati SHACL.
+
+Ogni riga contiene il campo `embedding_text`, composto da componente SHACL, espressione leggibile del percorso e messaggio di validazione. Sono esclusi da questo testo gli identificativi di dataset, lo shape model, la severità, i focus node e i valori RDF specifici: tali campi restano metadati utilizzabili per filtrare e interpretare i cluster, ma non influenzano direttamente la similarità testuale. Il campo `result_node` è locale al named graph e deve essere associato almeno a `report_graph_iri` per ricostruire il risultato d'origine.
+
+Il successivo modulo di clustering potrà riutilizzare questa funzione, generare embedding semantici e applicare HDBSCAN senza duplicare l'accesso a PyOxigraph o la logica di estrazione SHACL. La futura interfaccia CLI appartiene allo stesso dominio `analysis` (ad esempio `analysis clusters`); le dipendenze di embedding e clustering saranno introdotte soltanto con quel modulo. In questa versione non è ancora eseguito alcun clustering e non sono generate etichette di cluster.
 
 ### Interpretazione e limiti
 
-Le versioni sono confrontate soltanto a parità di livello di validazione. Il profilo base (`dcatap<versione>`) non viene aggregato con `level1`, `level2` o `level3`, perché applicano insiemi di vincoli differenti. Il confronto appaiato usa lo stesso `dataset_id` e lo stesso `validator_url`; i dataset senza entrambe le validazioni concluse sono esclusi dal confronto e il numero di coppie effettive è riportato nei CSV.
+Le versioni DCAT-AP sono confrontate soltanto a parità di configurazione: `level1`, `level2`, `level3` oppure `all`. Un identificativo senza suffisso `levelN` rappresenta la configurazione **All shapes** e viene classificato come `all`, non come `base`. I confronti appaiati richiedono lo stesso `dataset_id`, lo stesso `validator_url` e una validazione conclusa in entrambe le versioni.
 
-Un aumento del numero di violation o warning indica un aumento dei risultati prodotti dalla configurazione, non dimostra da solo un peggioramento intrinseco dei metadati: tra versioni possono cambiare le shape e i vincoli applicati. Analogamente, più risultati SHACL non equivalgono necessariamente a più requisiti distinti violati, perché uno stesso problema può generare più risultati. Per questo i riepiloghi riportano sia le occorrenze sia il numero di dataset distinti interessati.
-
-La conformità è conservata e riportata, ma quando è molto rara o uniforme non è sufficiente da sola a distinguere le configurazioni. Le analisi affiancano quindi allo stato binario la distribuzione dei risultati, la loro dispersione, le variazioni appaiate e le componenti/proprietà coinvolte.
+Un aumento dei risultati SHACL non dimostra da solo un peggioramento intrinseco dei metadata: tra versioni possono cambiare gli shape e i vincoli applicati. Occorrenze e diffusione tra dataset sono misure differenti e devono essere interpretate separatamente. Inoltre, `conforms=false` non equivale necessariamente alla presenza di `sh:Violation`: un report contenente soltanto warning può comunque risultare non conforme.

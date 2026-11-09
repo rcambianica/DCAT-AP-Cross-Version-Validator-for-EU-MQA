@@ -528,7 +528,7 @@ __pycache__/
 *.pyc
 analysis.db
 data/
-data/
+risultati-analisi/
 build/
 *.egg-info
 .prettierc

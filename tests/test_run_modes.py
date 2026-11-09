@@ -84,13 +84,13 @@ class RunModeTests(unittest.TestCase):
 
     def test_cli_short_circuit_option_is_opt_in(self):
         with patch("src.cli.run_validation") as run_mock, patch(
-            "sys.argv", ["dcat-ap-cv", "run"]
+            "sys.argv", ["dcat-ap-cv", "validation", "run"]
         ):
             main()
         run_mock.assert_called_once_with(limit=None, short_circuit=False)
 
         with patch("src.cli.run_validation") as run_mock, patch(
-            "sys.argv", ["dcat-ap-cv", "run", "--short-circuit"]
+            "sys.argv", ["dcat-ap-cv", "validation", "run", "--short-circuit"]
         ):
             main()
         run_mock.assert_called_once_with(limit=None, short_circuit=True)

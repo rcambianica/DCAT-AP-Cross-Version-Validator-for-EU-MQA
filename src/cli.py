@@ -232,7 +232,7 @@ def _run_chain(
     rdf_bytes: bytes,
     chain: list[str],
 ) -> bool:
-    """Run a Level 1 -> 2 -> 3 -> base chain with short-circuiting.
+    """Run a Level 1 -> 2 -> 3 -> All shapes chain with short-circuiting.
 
     Returns True when the chain reached a terminal state: either the last
     applicable profile was validated, or a higher level was intentionally
@@ -257,7 +257,7 @@ def _run_chain(
             return False
 
         if result.conforms is False:
-            # The Level 1/2/3/base chain is monotonic for MQA's shape levels:
+            # The Level 1/2/3/All shapes chain is monotonic for MQA's shape levels:
             # higher levels add constraints. Do not execute impossible-to-pass
             # continuations once the current prerequisite is non-conformant.
             for skipped_profile in chain[index + 1 :]:
@@ -491,102 +491,149 @@ def run_sparql(query: str, output_format: str = "tsv") -> None:
     else:
         raise SystemExit("Il comando sparql supporta query SELECT e ASK; per CONSTRUCT usare Oxigraph Server/YASGUI.")
 
-def main() -> None:
+def _add_analysis_options(parser: argparse.ArgumentParser, mode: str) -> None:
+    parser.add_argument("--out", type=Path, default=Path("analysis-output"),
+                        help="Directory di destinazione degli artefatti")
+    if mode in {"quantitative", "all"}:
+        parser.add_argument("--db", type=Path, default=None,
+                            help="Database SQLite (default: MQA_DB_PATH o analysis.db)")
+        parser.add_argument("--catalogue", default=None,
+                            help="Filtra l'analisi quantitativa per catalogo")
+        parser.add_argument("--category", default=None,
+                            help="Filtra l'analisi quantitativa per categoria")
+        parser.add_argument("--no-charts", action="store_true",
+                            help="Non generare grafici nell'analisi quantitativa")
+    if mode in {"qualitative", "all"}:
+        parser.add_argument("--store", type=Path, default=None,
+                            help="Store PyOxigraph (default: MQA_REPORT_STORE_PATH o data/validation-reports)")
+        parser.add_argument("--shape-model", action="append", default=None,
+                            help="Filtra per shape model (ripetibile)")
+        parser.add_argument("--severity", action="append", choices=["Violation", "Warning", "Info"], default=None,
+                            help="Severità da includere (ripetibile; default: tutte)")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the single hierarchical CLI used by every project capability."""
     parser = argparse.ArgumentParser(
-        description="DCAT-AP Cross-Version Validator for EU MQA: cross-version validation using the EU MQA SHACL validator"
+        prog="dcat-ap-cv",
+        description="DCAT-AP Cross-Version Validator for EU MQA",
     )
-    subparsers = parser.add_subparsers(dest="command")
+    domains = parser.add_subparsers(dest="domain")
 
-    discover_parser = subparsers.add_parser(
-        "discover",
-        help="Recupera solo gli ID dei dataset tramite Hub Search e li salva nell'inventario SQLite",
-    )
-    discover_parser.add_argument(
-        "--limit", type=int, default=None,
-        help="Numero massimo di dataset da inserire",
-    )
-    discover_parser.add_argument(
-        "--catalogue", default=None,
-        help="Hub catalogue ID (default: dati-gov-it)",
-    )
-    discover_parser.add_argument(
-        "--category", action="append", default=None,
-        help="Categoria Hub Search (ripetibile; ID come ENVI o etichetta come Ambiente; accetta anche valori separati da virgola)",
-    )
+    catalogue = domains.add_parser("catalogue", help="Discovery e metadati del catalogo Hub Search")
+    catalogue_commands = catalogue.add_subparsers(dest="catalogue_command", required=True)
+    categories = catalogue_commands.add_parser("categories", help="Elenca le categorie disponibili")
+    categories.add_argument("--catalogue", default=None, help="Hub catalogue ID (default: dati-gov-it)")
+    categories.set_defaults(handler=lambda args: list_categories(catalogue_id=args.catalogue))
 
-    categories_parser = subparsers.add_parser(
-        "categories", help="Elenca dinamicamente le categorie disponibili nel catalogo",
-    )
-    categories_parser.add_argument(
-        "--catalogue", default=None, help="Hub catalogue ID (default: dati-gov-it)",
-    )
+    discover = catalogue_commands.add_parser("discover", help="Aggiunge gli ID dei dataset all'inventario SQLite")
+    discover.add_argument("--limit", type=int, default=None, help="Numero massimo di dataset da inserire")
+    discover.add_argument("--catalogue", default=None, help="Hub catalogue ID (default: dati-gov-it)")
+    discover.add_argument("--category", action="append", default=None,
+                          help="Categoria Hub Search: ID o etichetta; ripetibile e separabile da virgole")
+    discover.set_defaults(handler=lambda args: discover_datasets(
+        catalogue_id=args.catalogue, category_id=args.category, limit=args.limit
+    ))
 
-    fetch_parser = subparsers.add_parser(
-        "fetch",
-        help="Scarica esclusivamente i dataset già presenti nell'inventario",
-    )
-    fetch_parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Numero massimo di dataset RDF da scaricare",
-    )
+    datasets = domains.add_parser("datasets", help="Acquisizione dei metadata RDF")
+    dataset_commands = datasets.add_subparsers(dest="datasets_command", required=True)
+    fetch = dataset_commands.add_parser("fetch", help="Scarica i dataset presenti nell'inventario")
+    fetch.add_argument("--limit", type=int, default=None, help="Numero massimo di dataset RDF da scaricare")
+    fetch.set_defaults(handler=lambda args: fetch_datasets(limit=args.limit))
 
-    run_parser = subparsers.add_parser(
-        "run",
-        help="Valida esclusivamente i dataset RDF già scaricati tramite il validator SHACL locale",
-    )
-    run_parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Numero massimo di dataset da validare",
-    )
-    run_parser.add_argument(
-        "--short-circuit",
-        action="store_true",
-        help="Abilita l'interruzione dei livelli successivi quando un livello precedente non è conforme",
-    )
+    validation = domains.add_parser("validation", help="Esecuzione delle validazioni SHACL")
+    validation_commands = validation.add_subparsers(dest="validation_command", required=True)
+    run = validation_commands.add_parser("run", help="Valida i dataset RDF tramite il validator SHACL locale")
+    run.add_argument("--limit", type=int, default=None, help="Numero massimo di dataset da validare")
+    run.add_argument("--short-circuit", action="store_true",
+                     help="Interrompe i livelli successivi dopo il primo livello non conforme")
+    run.set_defaults(handler=lambda args: run_validation(
+        limit=args.limit, short_circuit=args.short_circuit
+    ))
 
-    report_parser = subparsers.add_parser(
-        "reports",
-        help="Interroga i report SHACL memorizzati nel triplestore e stampa JSON su stdout",
+    reports = domains.add_parser("reports", help="Consultazione dei validation report SHACL")
+    report_commands = reports.add_subparsers(dest="reports_command", required=True)
+    show = report_commands.add_parser("show", help="Mostra i risultati SHACL dei report memorizzati")
+    show.add_argument("--dataset-id", default=None, help="Filtra per ID del dataset")
+    show.add_argument("--profile", default=None, help="Filtra per shapeModel")
+    show.add_argument("--severity", choices=["Violation", "Warning", "Info"], default=None,
+                      help="Filtra per severità SHACL")
+    show.add_argument("--limit", type=int, default=50,
+                      help="Numero massimo di ValidationResult mostrati (default: 50, massimo: 10000)")
+    show.add_argument("--raw-report", action="store_true",
+                      help="Serializza il report RDF; richiede --dataset-id e --profile")
+    show.set_defaults(handler=lambda args: show_report_details(
+        args.dataset_id, args.profile, args.severity, args.limit, args.raw_report
+    ))
+
+    query = domains.add_parser("query", help="Interrogazione del triplestore")
+    query_commands = query.add_subparsers(dest="query_command", required=True)
+    sparql = query_commands.add_parser("sparql", help="Esegue query SPARQL SELECT/ASK in sola lettura")
+    source = sparql.add_mutually_exclusive_group(required=True)
+    source.add_argument("--query-file", type=Path, help="File .sparql da eseguire")
+    source.add_argument("--query", type=str, help="Query SPARQL passata direttamente")
+    sparql.add_argument("--format", choices=["tsv", "json"], default="tsv",
+                        help="Formato dell'output SELECT (default: tsv)")
+
+    def _execute_sparql(args):
+        if args.query_file:
+            try:
+                query_text = args.query_file.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise SystemExit(f"Impossibile leggere {args.query_file}: {exc}") from exc
+        else:
+            query_text = args.query
+        run_sparql(query_text, args.format)
+
+    sparql.set_defaults(handler=_execute_sparql)
+
+    analysis = domains.add_parser("analysis", help="Analisi quantitativa e qualitativa dei validation report")
+    analysis_commands = analysis.add_subparsers(dest="analysis_command", required=True)
+    for mode, help_text in (
+        ("quantitative", "Statistiche e confronti appaiati dai dati SQLite"),
+        ("qualitative", "Estrazione e aggregazione dei risultati RDF da PyOxigraph"),
+        ("all", "Esegue entrambe le analisi"),
+    ):
+        command = analysis_commands.add_parser(mode, help=help_text)
+        _add_analysis_options(command, mode)
+        command.set_defaults(analysis_mode=mode, handler=_execute_analysis)
+
+    return parser
+
+
+def _execute_analysis(args) -> dict:
+    from src.analysis import analyze
+
+    cfg = Config()
+    result = analyze(
+        mode=args.analysis_mode,
+        db_path=getattr(args, "db", None) or cfg.db_path,
+        report_store_path=getattr(args, "store", None) or cfg.report_store_path,
+        output_dir=args.out,
+        catalogue_id=getattr(args, "catalogue", None),
+        category_id=getattr(args, "category", None),
+        shape_models=getattr(args, "shape_model", None),
+        severities=getattr(args, "severity", None),
+        charts=not getattr(args, "no_charts", False),
     )
-    report_parser.add_argument("--dataset-id", default=None, help="Filtra per ID del dataset")
-    report_parser.add_argument("--profile", default=None, help="Filtra per shapeModel, ad esempio dcatap301level1")
-    report_parser.add_argument("--severity", choices=["Violation", "Warning", "Info"], default=None, help="Filtra per severità SHACL")
-    report_parser.add_argument("--limit", type=int, default=50, help="Numero massimo di ValidationResult mostrati (default: 50, massimo: 10000)")
-    report_parser.add_argument("--raw-report", action="store_true", help="Serializza il report dal triplestore su stdout; richiede --dataset-id e --profile")
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return result
 
-    sparql_parser = subparsers.add_parser(
-        "sparql", help="Esegue una query SPARQL SELECT/ASK sul triplestore (sola lettura)",
-    )
-    sparql_source = sparql_parser.add_mutually_exclusive_group(required=True)
-    sparql_source.add_argument("--query-file", type=str, help="File .sparql da eseguire")
-    sparql_source.add_argument("--query", type=str, help="Query SPARQL passata direttamente")
-    sparql_parser.add_argument("--format", choices=["tsv", "json"], default="tsv", help="Formato dell'output SELECT (default: tsv)")
 
-    args = parser.parse_args()
-
-    if args.command in {"discover", "fetch", "run", "reports"}:
-        if args.limit is not None and args.limit < 1:
-            parser.error("--limit deve essere maggiore di zero")
-
-    if args.command == "discover":
-        discover_datasets(catalogue_id=args.catalogue, category_id=args.category, limit=args.limit)
-    elif args.command == "categories":
-        list_categories(catalogue_id=args.catalogue)
-    elif args.command == "fetch":
-        fetch_datasets(limit=args.limit)
-    elif args.command == "run":
-        run_validation(limit=args.limit, short_circuit=args.short_circuit)
-    elif args.command == "reports":
-        show_report_details(args.dataset_id, args.profile, args.severity, args.limit, args.raw_report)
-    elif args.command == "sparql":
-        query = Path(args.query_file).read_text(encoding="utf-8") if args.query_file else args.query
-        run_sparql(query, args.format)
-    else:
+def main(argv: list[str] | None = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.domain is None:
         parser.print_help()
+        return
+
+    limit = getattr(args, "limit", None)
+    if limit is not None and limit < 1:
+        parser.error("--limit deve essere maggiore di zero")
+    if getattr(args, "reports_command", None) == "show" and not 1 <= args.limit <= 10000:
+        parser.error("--limit per reports show deve essere compreso tra 1 e 10000")
+
+    args.handler(args)
 
 
 if __name__ == "__main__":

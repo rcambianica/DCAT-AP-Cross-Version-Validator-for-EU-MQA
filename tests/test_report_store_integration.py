@@ -1,5 +1,4 @@
 """Optional integration tests against the real PyOxigraph engine."""
-import importlib.util
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,7 +6,15 @@ from pathlib import Path
 from src.report_store import ValidationReportStore
 
 
-@unittest.skipUnless(importlib.util.find_spec("pyoxigraph"), "pyoxigraph non installato")
+def _pyoxigraph_importable() -> bool:
+    try:
+        import pyoxigraph  # noqa: F401
+    except (ImportError, OSError):
+        return False
+    return True
+
+
+@unittest.skipUnless(_pyoxigraph_importable(), "pyoxigraph non installato o incompatibile con il runtime Python")
 class PyOxigraphIntegrationTests(unittest.TestCase):
     REPORT = b'''@prefix sh: <http://www.w3.org/ns/shacl#> .
 @prefix ex: <https://example.org/> .

@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from src.profiles import discover_profiles
+from src.profiles import discover_profiles, ordered_validation_groups, ordered_validation_plan
 
 
 OPENAPI = """openapi: 3.0.0
@@ -36,6 +36,18 @@ class ProfileDiscoveryTests(unittest.TestCase):
             "dcatap301level1", "dcatap301level2", "dcatap301"
         ])
         self.assertTrue(source.source.startswith("file:"))
+
+    def test_unsuffixed_all_shapes_profile_is_last_in_its_chain(self):
+        profiles = [
+            "dcatap301level2", "dcatap300level1", "dcatap301",
+            "dcatap301level1", "dcatap300", "dcatap300level3",
+        ]
+        groups = ordered_validation_groups(profiles)
+        self.assertEqual(groups, [
+            ["dcatap301level1", "dcatap301level2", "dcatap301"],
+            ["dcatap300level1", "dcatap300level3", "dcatap300"],
+        ])
+        self.assertEqual(ordered_validation_plan(profiles), [item for group in groups for item in group])
 
     def test_missing_local_yaml_fails_instead_of_falling_back(self):
         with tempfile.TemporaryDirectory() as tmp:

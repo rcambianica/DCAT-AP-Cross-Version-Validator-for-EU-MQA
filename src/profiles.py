@@ -122,8 +122,8 @@ def discover_profiles(openapi_path: Path | None = None) -> ProfileSource:
 def _chain_key(profile: str) -> tuple[str, str | None]:
     """Return (chain key, level) for validation scheduling.
 
-    Level profiles are grouped with their base profile. Profiles excluded by
-    the configured filters never enter the validation plan.
+    Level profiles are grouped with the matching unsuffixed All shapes profile.
+    Profiles excluded by the configured filters never enter the validation plan.
     """
     match = LEVEL_RE.fullmatch(profile)
     if match:
@@ -132,9 +132,10 @@ def _chain_key(profile: str) -> tuple[str, str | None]:
 
 
 def ordered_validation_groups(profiles: list[str]) -> list[list[str]]:
-    """Return independent validation chains with Level 1 -> 2 -> 3 -> base order.
+    """Return validation chains ordered as Level 1 -> 2 -> 3 -> All shapes.
 
-    Profiles without numbered levels form a one-item chain.
+    An unsuffixed profile is appended to the chain sharing its profile stem;
+    otherwise it forms a one-item chain.
     """
     groups: list[tuple[str, list[str]]] = []
     by_key: dict[str, int] = {}
@@ -149,16 +150,16 @@ def ordered_validation_groups(profiles: list[str]) -> list[list[str]]:
     ordered: list[list[str]] = []
     for _, members in groups:
         levels: dict[int, str] = {}
-        bases: list[str] = []
+        all_shapes: list[str] = []
         for profile in members:
             match = LEVEL_RE.fullmatch(profile)
             if match:
                 levels[int(match.group("level"))] = profile
             else:
-                bases.append(profile)
+                all_shapes.append(profile)
 
         chain = [levels[level] for level in (1, 2, 3) if level in levels]
-        chain.extend(bases)
+        chain.extend(all_shapes)
         ordered.append(chain)
 
     return ordered
