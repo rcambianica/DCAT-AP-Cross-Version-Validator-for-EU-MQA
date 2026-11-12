@@ -34,6 +34,30 @@ CATALOG_GRAPH_IRI = "urn:mqa:validation-catalog"
 SEVERITIES = ("Violation", "Warning", "Info")
 LEVEL_ORDER = {"all": 0, "level1": 1, "level2": 2, "level3": 3, "unknown": 4}
 
+# Ordered profile chains used for the five comparative charts. Each adjacent
+# pair is compared on the same dataset and against the same validator endpoint.
+COMPARISON_SEQUENCES: dict[str, tuple[str, ...]] = {
+    "dcatap301": (
+        "dcatap301level1", "dcatap301level2", "dcatap301level3", "dcatap301",
+    ),
+    "dcatap300": (
+        "dcatap300level1", "dcatap300level2", "dcatap300level3", "dcatap300",
+    ),
+    "dcatap211": (
+        "dcatap211level1", "dcatap211level2", "dcatap211level3", "dcatap211",
+    ),
+    "dcatap210": ("dcatap210level1", "dcatap210"),
+    "legacy": ("dcatap11", "dcatap12", "dcatap121", "dcatap201"),
+}
+
+COMPARISON_TITLES = {
+    "dcatap301": "DCAT-AP 3.0.1",
+    "dcatap300": "DCAT-AP 3.0.0",
+    "dcatap211": "DCAT-AP 2.1.1",
+    "dcatap210": "DCAT-AP 2.1.0",
+    "legacy": "DCAT-AP 1.1 → 2.0.1",
+}
+
 
 class AnalysisError(RuntimeError):
     """Raised when an analysis source does not match the expected schema."""
@@ -196,13 +220,31 @@ def _quantitative_profile_rows(validations: Sequence[Mapping[str, Any]]) -> list
         affected_v = len({row["dataset_id"] for row in rows if int(row["violations"] or 0) > 0})
         affected_w = len({row["dataset_id"] for row in rows if int(row["warnings"] or 0) > 0})
         affected_i = len({row["dataset_id"] for row in rows if int(row["infos"] or 0) > 0})
-        conforming = sum(int(row["conforms"] == 1) for row in rows)
+        # Use the validator's explicit conforms flag to classify outcomes.
+        # A non-conforming validation is then split by the presence/absence
+        # of Violation-severity results. Warning and Info-only outcomes belong
+        # to the non-conforming/no-Violation category.
+        conforming = sum(int(int(row["conforms"]) == 1) for row in rows)
+        nonconforming_with_violations = sum(
+            int(int(row["conforms"]) == 0 and int(row["violations"] or 0) > 0)
+            for row in rows
+        )
+        nonconforming_without_violations = sum(
+            int(int(row["conforms"]) == 0 and int(row["violations"] or 0) == 0)
+            for row in rows
+        )
+
+        # Keep the severity-only counts as diagnostics in the CSV. They are
+        # distinct from the three mutually exclusive outcome categories.
         with_violations = sum(int(int(row["violations"] or 0) > 0) for row in rows)
         without_violations_findings = sum(
             int(int(row["violations"] or 0) == 0 and (int(row["warnings"] or 0) + int(row["infos"] or 0)) > 0)
             for row in rows
         )
-        no_findings = len(rows) - with_violations - without_violations_findings
+        no_findings = sum(
+            int(int(row["violations"] or 0) == 0 and int(row["warnings"] or 0) == 0 and int(row["infos"] or 0) == 0)
+            for row in rows
+        )
         n = len(rows)
         output.append({
             "shape_model": profile,
@@ -212,6 +254,10 @@ def _quantitative_profile_rows(validations: Sequence[Mapping[str, Any]]) -> list
             "datasets": distinct_datasets,
             "conforming_validations": conforming,
             "conformity_pct": round(100 * conforming / n, 2) if n else 0.0,
+            "nonconforming_with_violations": nonconforming_with_violations,
+            "nonconforming_with_violations_pct": round(100 * nonconforming_with_violations / n, 2) if n else 0.0,
+            "nonconforming_without_violations": nonconforming_without_violations,
+            "nonconforming_without_violations_pct": round(100 * nonconforming_without_violations / n, 2) if n else 0.0,
             "with_violations": with_violations,
             "without_violations_with_findings": without_violations_findings,
             "no_findings": no_findings,
@@ -302,32 +348,120 @@ def _build_paired_comparisons(validations: Sequence[Mapping[str, Any]]) -> tuple
     return pairs, summaries
 
 
-def _generate_quantitative_charts(output_dir: Path, profile_rows: Sequence[Mapping[str, Any]], validations: Sequence[Mapping[str, Any]], paired_summary: Sequence[Mapping[str, Any]]) -> list[str]:
+def _build_sequence_comparison_summaries(
+    validations: Sequence[Mapping[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Summarize paired changes along the five explicitly requested profiles.
+
+    Pairing is performed by (dataset_id, validator_url), so each transition
+    compares the same dataset validated by the same endpoint.
+    """
+    by_profile: dict[str, dict[tuple[str, str], Mapping[str, Any]]] = defaultdict(dict)
+    for row in validations:
+        profile = str(row["shape_model"] or "")
+        if profile:
+            key = (str(row["dataset_id"]), str(row["validator_url"] or ""))
+            by_profile[profile][key] = row
+
+    output: dict[str, list[dict[str, Any]]] = {}
+    for sequence_name, profiles in COMPARISON_SEQUENCES.items():
+        transitions: list[dict[str, Any]] = []
+        for older, newer in zip(profiles, profiles[1:]):
+            old_rows = by_profile.get(older, {})
+            new_rows = by_profile.get(newer, {})
+            shared_keys = old_rows.keys() & new_rows.keys()
+            counts = Counter()
+            for key in shared_keys:
+                old_row = old_rows[key]
+                new_row = new_rows[key]
+                delta_v = int(new_row["violations"] or 0) - int(old_row["violations"] or 0)
+                delta_w = int(new_row["warnings"] or 0) - int(old_row["warnings"] or 0)
+                counts[f"violations_{'increased' if delta_v > 0 else 'decreased' if delta_v < 0 else 'unchanged'}"] += 1
+                counts[f"warnings_{'increased' if delta_w > 0 else 'decreased' if delta_w < 0 else 'unchanged'}"] += 1
+
+            transitions.append({
+                "from_profile": older,
+                "to_profile": newer,
+                "paired_datasets": len(shared_keys),
+                **{name: counts[name] for name in (
+                    "violations_increased", "violations_decreased", "violations_unchanged",
+                    "warnings_increased", "warnings_decreased", "warnings_unchanged",
+                )},
+            })
+        output[sequence_name] = transitions
+    return output
+
+
+def _build_sequence_profile_count_rows(
+    validations: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Aggregate total Violation and Warning findings for each requested profile.
+
+    Counts are sums over successfully completed validation rows. The number of
+    validations and distinct datasets is included alongside each total so that
+    differences in sample coverage remain visible when interpreting the plots.
+    Profiles with no successful validations are retained with empty totals.
+    """
+    by_profile: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for row in validations:
+        profile = str(row["shape_model"] or "")
+        if profile:
+            by_profile[profile].append(row)
+
+    output: list[dict[str, Any]] = []
+    for sequence_name, profiles in COMPARISON_SEQUENCES.items():
+        for position, profile in enumerate(profiles, start=1):
+            rows = by_profile.get(profile, [])
+            output.append({
+                "sequence": sequence_name,
+                "sequence_title": COMPARISON_TITLES[sequence_name],
+                "sequence_position": position,
+                "shape_model": profile,
+                "validation_count": len(rows),
+                "dataset_count": len({str(row["dataset_id"]) for row in rows}),
+                "total_violations": sum(int(row["violations"] or 0) for row in rows) if rows else "",
+                "total_warnings": sum(int(row["warnings"] or 0) for row in rows) if rows else "",
+            })
+    return output
+
+
+def _generate_quantitative_charts(
+    output_dir: Path,
+    profile_rows: Sequence[Mapping[str, Any]],
+    validations: Sequence[Mapping[str, Any]],
+) -> list[str]:
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import numpy as np
-    except ImportError as exc:  # pragma: no cover - depends on optional plotting environment
+    except ImportError as exc:
         raise AnalysisError("Per generare i grafici installare matplotlib e numpy") from exc
 
     generated: list[str] = []
+    # Remove the previous chart names so an existing output directory cannot
+    # retain obsolete bar charts next to the replacement line charts.
+    for sequence_name in COMPARISON_SEQUENCES:
+        obsolete_chart = output_dir / f"paired_version_changes_{sequence_name}.png"
+        if obsolete_chart.exists():
+            obsolete_chart.unlink()
+
     if profile_rows:
         labels = [row["shape_model"] for row in profile_rows]
         fig, ax = plt.subplots(figsize=(max(12, len(labels) * 0.65), 7))
         bottom = np.zeros(len(labels))
-        for key, label in (
-            ("no_findings_pct", "Nessun risultato"),
-            ("findings_without_violations_pct", "Risultati senza violation"),
-            ("with_violations_pct", "Almeno una violation"),
+        for key, label, color in (
+            ("conformity_pct", "Conforme", "#2E7D32"),
+            ("nonconforming_with_violations_pct", "Non conforme con almeno una violazione", "#C62828"),
+            ("nonconforming_without_violations_pct", "Non conforme senza violazioni", "#F9A825"),
         ):
             values = np.asarray([row[key] for row in profile_rows], dtype=float)
-            ax.bar(labels, values, bottom=bottom, label=label)
+            ax.bar(labels, values, bottom=bottom, label=label, color=color)
             bottom += values
         ax.set_ylim(0, 100)
         ax.set_ylabel("Validazioni (%)")
         ax.set_xlabel("Shape model")
-        ax.set_title("Distribuzione degli esiti per shape model")
+        ax.set_title("Esiti delle validazioni per shape model")
         ax.tick_params(axis="x", rotation=65)
         ax.legend()
         ax.grid(axis="y", linestyle=":", alpha=0.4)
@@ -341,12 +475,12 @@ def _generate_quantitative_charts(output_dir: Path, profile_rows: Sequence[Mappi
         fig, ax = plt.subplots(figsize=(max(12, len(labels) * 0.65), 7))
         x = np.arange(len(labels))
         width = 0.26
-        for offset, key, label in (
-            (-width, "total_violations", "Violation"),
-            (0, "total_warnings", "Warning"),
-            (width, "total_infos", "Info"),
+        for offset, key, label, color in (
+            (-width, "total_violations", "Violation", "#C62828"),
+            (0, "total_warnings", "Warning", "#EF6C00"),
+            (width, "total_infos", "Info", "#F9A825"),
         ):
-            ax.bar(x + offset, [row[key] for row in profile_rows], width, label=label)
+            ax.bar(x + offset, [row[key] for row in profile_rows], width, label=label, color=color)
         ax.set_xticks(x, labels, rotation=65, ha="right")
         ax.set_ylabel("Risultati SHACL")
         ax.set_title("Numero complessivo di risultati per severità e shape model")
@@ -359,6 +493,8 @@ def _generate_quantitative_charts(output_dir: Path, profile_rows: Sequence[Mappi
         plt.close(fig)
         generated.append(name)
 
+    # This chart is intentionally unchanged: it shows the per-validation
+    # distributions of Violation and Warning counts for each shape model.
     if validations and profile_rows:
         labels = [row["shape_model"] for row in profile_rows]
         fig, axes = plt.subplots(2, 1, figsize=(max(12, len(labels) * 0.7), 10), sharex=True)
@@ -384,30 +520,46 @@ def _generate_quantitative_charts(output_dir: Path, profile_rows: Sequence[Mappi
         plt.close(fig)
         generated.append(name)
 
-    if paired_summary:
-        labels = [f"{row['level']}\n{row['from_version']} → {row['to_version']}" for row in paired_summary]
-        x = np.arange(len(labels))
-        width = 0.24
-        fig, axes = plt.subplots(2, 1, figsize=(max(10, len(labels) * 0.9), 9), sharex=True)
-        for ax, prefix, title in (
-            (axes[0], "violations", "Variazione delle violation"),
-            (axes[1], "warnings", "Variazione dei warning"),
+    # Generate one two-panel line chart for each explicitly requested profile
+    # sequence. The y values are total findings across the successful SQLite
+    # validation rows for each profile; sample sizes are shown on the x ticks.
+    sequence_rows = _build_sequence_profile_count_rows(validations)
+    for sequence_name, profiles in COMPARISON_SEQUENCES.items():
+        rows = [row for row in sequence_rows if row["sequence"] == sequence_name]
+        if not any(row["validation_count"] for row in rows):
+            continue
+
+        x = np.arange(len(profiles))
+        labels = [
+            f"{row['shape_model']}\n(n={row['validation_count']})"
+            for row in rows
+        ]
+        fig, axes = plt.subplots(2, 1, figsize=(max(11, len(profiles) * 3.0), 9), sharex=True)
+
+        for ax, field, title, color, legend_label in (
+            (axes[0], "total_violations", "Numero di violazioni", "#C62828", "Violazioni"),
+            (axes[1], "total_warnings", "Numero di warning", "#EF6C00", "Warning"),
         ):
-            for offset, suffix, label in (
-                (-width, "increased", "Aumentati"),
-                (0, "decreased", "Diminuiti"),
-                (width, "unchanged", "Invariati"),
-            ):
-                ax.bar(x + offset, [row[f"{prefix}_{suffix}"] for row in paired_summary], width, label=label)
-            ax.set_ylabel("Dataset")
+            values = [
+                float(row[field]) if row["validation_count"] else np.nan
+                for row in rows
+            ]
+            ax.plot(
+                x, values, color=color, marker="o", markersize=7,
+                linewidth=2, label=legend_label,
+            )
+            ax.set_ylabel(title)
             ax.set_title(title)
-            ax.legend()
+            ax.set_ylim(bottom=0)
+            ax.legend(loc="best")
             ax.grid(axis="y", linestyle=":", alpha=0.4)
             ax.set_axisbelow(True)
-        axes[1].set_xticks(x, labels, rotation=35, ha="right")
-        fig.suptitle("Confronto appaiato dei risultati tra versioni DCAT-AP")
+
+        axes[1].set_xticks(x, labels, rotation=0, ha="center")
+        axes[1].set_xlabel("ShapeModel DCAT-AP (n = validazioni incluse)")
+        fig.suptitle(f"Conteggio di violazioni e warning – {COMPARISON_TITLES[sequence_name]}")
         fig.tight_layout()
-        name = "paired_version_changes.png"
+        name = f"profile_severity_trends_{sequence_name}.png"
         fig.savefig(output_dir / name, dpi=200, bbox_inches="tight")
         plt.close(fig)
         generated.append(name)
@@ -464,7 +616,9 @@ def analyze_quantitative(
     _write_csv(out / "validation_execution_status.csv", ["execution_status", "http_status", "error", "count"], validation_status_rows)
     _write_csv(out / "profile_summary.csv", [
         "shape_model", "dcatap_version", "shape_level", "validations", "datasets", "conforming_validations",
-        "conformity_pct", "with_violations", "without_violations_with_findings", "no_findings",
+        "conformity_pct", "nonconforming_with_violations", "nonconforming_with_violations_pct",
+        "nonconforming_without_violations", "nonconforming_without_violations_pct",
+        "with_violations", "without_violations_with_findings", "no_findings",
         "total_results", "total_violations", "total_warnings", "total_infos",
         "datasets_with_violations", "datasets_with_violations_pct", "datasets_with_warnings",
         "datasets_with_warnings_pct", "datasets_with_infos", "datasets_with_infos_pct",
@@ -476,6 +630,11 @@ def analyze_quantitative(
         "validation_id", "dataset_id", "validator_url", "shape_model", "dcatap_version", "shape_level",
         "violations", "warnings", "infos", "results", "conforms", "validated_at", "report_status",
     ], validation_distribution)
+    sequence_profile_counts = _build_sequence_profile_count_rows(validations)
+    _write_csv(out / "sequence_profile_counts.csv", [
+        "sequence", "sequence_title", "sequence_position", "shape_model",
+        "validation_count", "dataset_count", "total_violations", "total_warnings",
+    ], sequence_profile_counts)
     _write_csv(out / "paired_version_deltas.csv", [
         "dataset_id", "validator_url", "level", "from_version", "to_version", "from_profile", "to_profile",
         "from_violations", "to_violations", "delta_violations", "from_warnings", "to_warnings", "delta_warnings",
@@ -486,7 +645,7 @@ def analyze_quantitative(
         "warnings_unchanged",
     ], paired_summary)
 
-    charts_generated = _generate_quantitative_charts(out, profile_rows, validation_distribution, paired_summary) if charts else []
+    charts_generated = _generate_quantitative_charts(out, profile_rows, validation_distribution) if charts else []
     summary = {
         "source": "SQLite",
         "database": str(Path(db_path).resolve()),
@@ -534,7 +693,21 @@ def _query_rows(report_store, sparql: str) -> list[dict[str, Any]]:
 
 
 def _term_string(term: Any) -> str | None:
-    return None if term is None else str(term)
+    """Return an RDF term's lexical/value form, not its RDF serialization.
+
+    PyOxigraph's ``str(term)`` is N-Triples syntax (for example,
+    ``<urn:example:graph>`` or ``"dcatap301level1"``). Catalog values are
+    consumed as plain strings and graph IRIs are passed back to Oxigraph, so
+    using that serialization would corrupt both IRIs and literals. RDFLib
+    terms are supported as well: URIRefs and BNodes fall back to ``str`` while
+    Literals expose their Python value through ``.value``.
+    """
+    if term is None:
+        return None
+    value = getattr(term, "value", None)
+    if value is not None:
+        return str(value)
+    return str(term)
 
 
 def _term_n3(term: Any) -> str | None:
@@ -740,7 +913,9 @@ def _load_report_catalog(report_store) -> list[dict[str, Any]]:
         graph_term = row.get("reportGraph")
         if graph_term is None:
             continue
-        graph_iri = str(graph_term)
+        graph_iri = _term_string(graph_term)
+        if not graph_iri:
+            continue
         unique[graph_iri] = {
             "report_graph_iri": graph_iri,
             "validation_id": _term_string(row.get("validationId")) or "",
@@ -787,7 +962,15 @@ def load_qualitative_results(
             if row["severity"] in selected_severities:
                 result_rows.append(row)
 
-    return {"reports": reports, "results": result_rows, "failed_graphs": failed_graphs}
+    return {
+        "reports": reports,
+        "results": result_rows,
+        "failed_graphs": failed_graphs,
+        "filters": {
+            "shape_models": sorted(selected_models),
+            "severities": sorted(selected_severities),
+        },
+    }
 
 
 def _aggregate_qualitative_rows(result_rows: Sequence[Mapping[str, Any]], reports: Sequence[Mapping[str, Any]]) -> dict[str, list[dict[str, Any]]]:
@@ -932,6 +1115,8 @@ def analyze_qualitative(
     reports = extracted["reports"]
     result_rows = extracted["results"]
     failed_graphs = extracted["failed_graphs"]
+    selected_models = extracted["filters"]["shape_models"]
+    selected_severities = extracted["filters"]["severities"]
     aggregates = _aggregate_qualitative_rows(result_rows, reports)
     report_headers = ["report_graph_iri", "validation_id", "dataset_id", "shape_model", "report_sha256", "report_triples", "stored_at"]
     result_headers = [
@@ -972,8 +1157,8 @@ def analyze_qualitative(
         "reports_unreadable": len(failed_graphs),
         "shape_models": len(aggregates["profile_summary"]),
         "results_included": len(result_rows),
-        "severity_filter": sorted(selected_severities),
-        "shape_model_filter": sorted(selected_models),
+        "severity_filter": selected_severities,
+        "shape_model_filter": selected_models,
         "output_dir": str(out.resolve()),
     }
     _write_json(out / "qualitative_summary.json", summary)

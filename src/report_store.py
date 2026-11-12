@@ -3,6 +3,11 @@ from __future__ import annotations
 
 from pathlib import Path
 from datetime import datetime, timezone
+import hashlib
+import json
+import os
+import re
+import tempfile
 
 
 class ReportStoreError(RuntimeError):
@@ -203,6 +208,177 @@ class ValidationReportStore:
         except Exception as exc:
             raise ReportStoreError(
                 f"Impossibile serializzare il report {graph_iri}: {exc}"
+            ) from exc
+
+    @staticmethod
+    def _sparql_string_literal(value: str) -> str:
+        """Return a safely escaped SPARQL string literal."""
+        # JSON string escaping is compatible with SPARQL string literals for
+        # quotes, backslashes, control characters and Unicode escape sequences.
+        return json.dumps(str(value), ensure_ascii=False)
+
+    @staticmethod
+    def _filename_token(value: str, *, fallback: str = "unknown") -> str:
+        """Convert metadata into a filesystem-safe, bounded filename token."""
+        token = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value)).strip("._-")
+        return (token[:80] or fallback)
+
+    def list_reports(
+        self,
+        *,
+        dataset_id: str | None = None,
+        shape_model: str | None = None,
+    ) -> list[dict[str, str | None]]:
+        """List report graph identifiers and catalog metadata.
+
+        Selection is performed against the Oxigraph report catalog, which is
+        the authoritative index for named graphs. Omitting both filters returns
+        every report registered in the catalog.
+        """
+        if dataset_id is not None and not dataset_id.strip():
+            raise ReportStoreError("dataset_id non può essere vuoto")
+        if shape_model is not None and not shape_model.strip():
+            raise ReportStoreError("shape_model non può essere vuoto")
+
+        filters = []
+        if dataset_id is not None:
+            filters.append(
+                f"FILTER(?datasetId = {self._sparql_string_literal(dataset_id)})"
+            )
+        if shape_model is not None:
+            filters.append(
+                f"FILTER(?shapeModel = {self._sparql_string_literal(shape_model)})"
+            )
+        filter_block = "\n            ".join(filters)
+
+        query = f"""
+            PREFIX mqa: <{self.MQA}>
+            SELECT ?reportGraph ?validationId ?datasetId ?shapeModel ?reportSha256
+            WHERE {{
+                GRAPH <{self.CATALOG_GRAPH_IRI}> {{
+                    ?reportGraph a mqa:ValidationReport ;
+                                 mqa:datasetId ?datasetId ;
+                                 mqa:shapeModel ?shapeModel .
+                    OPTIONAL {{ ?reportGraph mqa:validationId ?validationId }}
+                    OPTIONAL {{ ?reportGraph mqa:reportSha256 ?reportSha256 }}
+                    {filter_block}
+                }}
+            }}
+            ORDER BY ?shapeModel ?datasetId ?validationId ?reportGraph
+        """
+        try:
+            rows = self.query(query)
+            reports = []
+            for row in rows:
+                def value(name: str) -> str | None:
+                    term = row[name]
+                    return getattr(term, "value", None) if term is not None else None
+
+                reports.append({
+                    "report_graph_iri": value("reportGraph"),
+                    "validation_id": value("validationId"),
+                    "dataset_id": value("datasetId"),
+                    "shape_model": value("shapeModel"),
+                    "report_sha256": value("reportSha256"),
+                })
+            return reports
+        except ReportStoreError:
+            raise
+        except Exception as exc:
+            raise ReportStoreError(
+                f"Impossibile elencare i validation report dal catalogo: {exc}"
+            ) from exc
+
+    def export_report_turtle(
+        self,
+        graph_iri: str,
+        output_path: Path | str,
+    ) -> Path:
+        """Export one named report graph as a Turtle file."""
+        destination = Path(output_path)
+        try:
+            body = self.dump_report(graph_iri, "turtle")
+            if not body:
+                raise ReportStoreError(f"Il report {graph_iri} non contiene triple")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            # Create the temporary file in the destination directory so that
+            # os.replace remains atomic (same filesystem) and concurrent
+            # exports do not share a fixed ``.tmp`` filename.
+            temporary_path: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="wb",
+                    prefix=f".{destination.name}.",
+                    suffix=".tmp",
+                    dir=destination.parent,
+                    delete=False,
+                ) as temporary:
+                    temporary.write(body)
+                    temporary.flush()
+                    os.fsync(temporary.fileno())
+                    temporary_path = Path(temporary.name)
+                os.replace(temporary_path, destination)
+            finally:
+                if temporary_path is not None:
+                    temporary_path.unlink(missing_ok=True)
+            return destination
+        except ReportStoreError:
+            raise
+        except Exception as exc:
+            raise ReportStoreError(
+                f"Impossibile esportare il report {graph_iri} in {destination}: {exc}"
+            ) from exc
+
+    def export_reports_turtle(
+        self,
+        output_dir: Path | str,
+        *,
+        dataset_id: str | None = None,
+        shape_model: str | None = None,
+    ) -> list[Path]:
+        """Export selected report graphs as individual Turtle files.
+
+        The two optional filters cover all supported selection modes:
+        - no filters: every report in the Oxigraph catalog;
+        - shape_model: all datasets validated with that shape model;
+        - dataset_id: all shape models available for that dataset;
+        - both filters: the report for the dataset/shape-model pair.
+        """
+        destination = Path(output_dir)
+        try:
+            destination.mkdir(parents=True, exist_ok=True)
+            reports = self.list_reports(
+                dataset_id=dataset_id, shape_model=shape_model
+            )
+            exported = []
+            for report in reports:
+                graph_iri = report["report_graph_iri"]
+                if not graph_iri:
+                    raise ReportStoreError(
+                        "Il catalogo contiene un validation report senza IRI del grafo"
+                    )
+
+                validation_id = self._filename_token(
+                    report["validation_id"] or "no-validation-id"
+                )
+                dataset_token = self._filename_token(report["dataset_id"] or "unknown-dataset")
+                shape_token = self._filename_token(report["shape_model"] or "unknown-shape")
+                digest = report["report_sha256"] or hashlib.sha256(
+                    graph_iri.encode("utf-8")
+                ).hexdigest()
+                filename = (
+                    f"validation-{validation_id}__dataset-{dataset_token}"
+                    f"__shape-{shape_token}__{digest[:12]}.ttl"
+                )
+                exported.append(
+                    self.export_report_turtle(graph_iri, destination / filename)
+                )
+            return exported
+        except ReportStoreError:
+            raise
+        except Exception as exc:
+            raise ReportStoreError(
+                f"Esportazione dei validation report non riuscita: {exc}"
             ) from exc
 
     def get_report_graph(self, graph_iri: str):

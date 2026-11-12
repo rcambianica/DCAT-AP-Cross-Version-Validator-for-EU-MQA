@@ -1,0 +1,18 @@
+PREFIX mqa: <urn:mqa:vocab:>
+
+SELECT
+    ?reportGraph
+    ?subject
+    ?predicate
+    ?object
+WHERE {
+    GRAPH <urn:mqa:validation-catalog> {
+        ?reportGraph a mqa:ValidationReport ;
+                    mqa:datasetId "DATASET_ID" .
+    }
+
+    GRAPH ?reportGraph {
+        ?subject ?predicate ?object .
+    }
+}
+ORDER BY ?reportGraph ?subject ?predicate ?object

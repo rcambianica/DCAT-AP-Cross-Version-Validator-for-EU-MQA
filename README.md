@@ -588,17 +588,18 @@ Il modulo genera i seguenti CSV:
 
 - `dataset_fetch_status.csv`: numero di dataset per stato di acquisizione RDF.
 - `validation_execution_status.csv`: conteggio delle righe di validazione per stato operativo, HTTP status ed eventuale errore.
-- `profile_summary.csv`: validazioni, dataset, conformità, conteggi e percentuali di violation, warning e info, statistiche descrittive e distribuzione degli esiti per shape model.
+- `profile_summary.csv`: validazioni, dataset, conformità, conteggi e percentuali di violation, warning e info, statistiche descrittive e distribuzione degli esiti per shape model. Le classi di esito sono mutuamente esclusive: conformi (`conforms=1`), non conformi con almeno una violation (`conforms=0` e `violations>0`) e non conformi senza violation (`conforms=0` e `violations=0`). Quest'ultima classe comprende i casi con soli warning, sole info o entrambi.
 - `validation_distribution.csv`: conteggi individuali per dataset e shape model.
-- `paired_version_deltas.csv`: variazioni individuali di violation e warning tra versioni adiacenti fra quelle presenti nel campione, a parità di dataset, validator e livello.
+- `paired_version_deltas.csv`: variazioni individuali di violation e warning tra versioni adiacenti fra quelle presenti nel campione, a parità di dataset, validator e livello. Questo CSV mantiene il confronto generale tra versioni con lo stesso livello.
 - `paired_version_summary.csv`: numero di dataset con conteggi aumentati, diminuiti o invariati per coppia di versioni disponibili e livello.
+- `sequence_profile_counts.csv`: conteggi totali di violation e warning per ciascun profilo delle cinque sequenze comparative, insieme al numero di validazioni e dataset inclusi.
 
-Con i grafici abilitati e dati disponibili vengono generati fino a quattro PNG:
+Con i grafici abilitati e dati disponibili vengono generati i seguenti PNG:
 
-1. `validation_outcomes.png`: distribuzione percentuale delle validazioni senza risultati, con risultati non-Violation e con almeno una Violation.
-2. `severity_totals.png`: conteggio complessivo di violation, warning e info per shape model.
-3. `result_distributions.png`: boxplot dei conteggi di violation e warning per validazione e shape model.
-4. `paired_version_changes.png`: variazioni appaiate dei conteggi tra versioni DCAT-AP adiacenti nel campione.
+1. `validation_outcomes.png`: distribuzione percentuale delle validazioni conformi (verde), non conformi con almeno una violation (rosso) e non conformi senza violation (giallo).
+2. `severity_totals.png`: conteggio complessivo per shape model, con violation in rosso, warning in arancione e info in giallo.
+3. `result_distributions.png`: boxplot dei conteggi di violation e warning per validazione e shape model. I cerchi rappresentano gli outlier oltre i baffi del boxplot (regola predefinita: 1,5 × IQR), non valori fuori da un intervallo di media.
+4. `profile_severity_trends_dcatap301.png`, `profile_severity_trends_dcatap300.png`, `profile_severity_trends_dcatap211.png`, `profile_severity_trends_dcatap210.png` e `profile_severity_trends_legacy.png`: cinque grafici a linee distinti. In ciascuno, l'asse x riporta i profili della sequenza nell'ordine indicato e l'asse y riporta il totale delle violazioni (pannello superiore, rosso) o dei warning (pannello inferiore, arancione) nelle validazioni riuscite presenti in SQLite. Le etichette mostrano anche il numero di validazioni incluse (`n`), perché il totale può risentire di coperture differenti tra profili. Se un profilo non ha validazioni riuscite, il relativo valore resta mancante e la linea si interrompe in quel punto.
 
 `quantitative_summary.json` registra sorgente, filtri, dimensione del campione, validazioni incluse/escluse, confronti appaiati e grafici generati. `--no-charts` disabilita soltanto la produzione PNG, non i CSV.
 

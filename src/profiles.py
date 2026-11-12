@@ -46,16 +46,28 @@ def _unique(values: list[str]) -> list[str]:
 
 
 def _filter_profiles(profiles: list[str]) -> list[str]:
-    """Exclude German and historical `orig` profiles, preserving source order."""
+    """Exclude German, historical `orig` and dcatap200 profiles, preserving source order."""
+
+    def should_exclude(value: str) -> bool:
+        normalized = value.casefold()
+        return (
+            is_german_profile(value)
+            or is_orig_profile(value)
+            or normalized == "dcatap200"
+        )
+
     excluded = list(dict.fromkeys(
-        value for value in profiles
-        if is_german_profile(value) or is_orig_profile(value)
+        value for value in profiles if should_exclude(value)
     ))
+
     if excluded:
-        logger.info("Excluding shapeModel profile(s): %s", ", ".join(excluded))
+        logger.info(
+            "Excluding shapeModel profile(s): %s",
+            ", ".join(excluded),
+        )
+
     return _unique([
-        value for value in profiles
-        if not is_german_profile(value) and not is_orig_profile(value)
+        value for value in profiles if not should_exclude(value)
     ])
 
 

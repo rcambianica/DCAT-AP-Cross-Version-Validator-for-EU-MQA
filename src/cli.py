@@ -466,6 +466,37 @@ def show_report_details(
 
 
 
+def export_validation_reports(
+    *,
+    dataset_id: str | None = None,
+    shape_model: str | None = None,
+    output_dir: Path = Path("validation-reports-turtle"),
+    report_store_path: Path | None = None,
+) -> dict:
+    """Export selected PyOxigraph validation-report graphs as Turtle files."""
+    from src.report_store import ValidationReportStore
+
+    cfg = Config()
+    store_path = report_store_path or cfg.report_store_path
+    store = ValidationReportStore(store_path, read_only=True)
+    paths = store.export_reports_turtle(
+        output_dir, dataset_id=dataset_id, shape_model=shape_model
+    )
+    result = {
+        "dataset_id": dataset_id,
+        "shape_model": shape_model,
+        "output_dir": str(output_dir),
+        "report_store": str(store_path),
+        "exported": len(paths),
+        "files": [str(path) for path in paths],
+    }
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    logger.info(
+        "Exported %d Turtle validation report(s) to %s", len(paths), output_dir
+    )
+    return result
+
+
 def run_sparql(query: str, output_format: str = "tsv") -> None:
     """Execute a read-only SPARQL query against the PyOxigraph store."""
     from src.report_store import ValidationReportStore
@@ -564,6 +595,24 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Serializza il report RDF; richiede --dataset-id e --profile")
     show.set_defaults(handler=lambda args: show_report_details(
         args.dataset_id, args.profile, args.severity, args.limit, args.raw_report
+    ))
+
+    export = report_commands.add_parser(
+        "export", help="Esporta i validation report selezionati in file Turtle"
+    )
+    export.add_argument("--dataset-id", default=None,
+                        help="Filtra per ID del dataset; senza filtri esporta tutti i report")
+    export.add_argument("--shape-model", default=None,
+                        help="Filtra per identificativo esatto dello shape model")
+    export.add_argument("--output-dir", type=Path, default=Path("validation-reports-turtle"),
+                        help="Directory di destinazione (default: validation-reports-turtle)")
+    export.add_argument("--store", type=Path, default=None,
+                        help="Directory dello store PyOxigraph (default: MQA_REPORT_STORE_PATH o data/validation-reports)")
+    export.set_defaults(handler=lambda args: export_validation_reports(
+        dataset_id=args.dataset_id,
+        shape_model=args.shape_model,
+        output_dir=args.output_dir,
+        report_store_path=args.store,
     ))
 
     query = domains.add_parser("query", help="Interrogazione del triplestore")

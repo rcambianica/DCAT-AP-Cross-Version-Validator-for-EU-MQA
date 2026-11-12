@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from src.analysis import analyze_qualitative, load_qualitative_results
 from src.report_store import ValidationReportStore
 
 
@@ -57,6 +58,22 @@ _:result a sh:ValidationResult ;
                 report_content_type="text/turtle",
                 report_triples=count_a,
             )
+
+            # Exercise the exact Oxigraph catalog -> Python IRI -> named graph
+            # round-trip used by qualitative analysis. ``str(NamedNode)`` is
+            # N-Triples syntax; the analysis must consume ``NamedNode.value``.
+            extracted = load_qualitative_results(store)
+            self.assertEqual(extracted["reports"][0]["report_graph_iri"], graph_a)
+            self.assertEqual(len(extracted["results"]), 1)
+            self.assertEqual(extracted["failed_graphs"], [])
+
+            analysis_summary = analyze_qualitative(
+                Path(tmp) / "oxigraph", Path(tmp) / "qualitative",
+                report_store=store,
+            )
+            self.assertEqual(analysis_summary["reports_read"], 1)
+            self.assertEqual(analysis_summary["reports_unreadable"], 0)
+            self.assertEqual(analysis_summary["results_included"], 1)
             catalog_rows = list(store.query(
                 "PREFIX mqa: <urn:mqa:vocab:> "
                 "SELECT ?model WHERE { GRAPH <urn:mqa:validation-catalog> { "
