@@ -526,9 +526,10 @@ MigrationBackup/
 .venv/
 __pycache__/
 *.pyc
-analysis.db
+*.db
+*.db-*
 data/
-risultati-analisi/
+analysis-output/
 build/
 *.egg-info
 .prettierc
