@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dcat-ap-cross-version-validator-for-eu-mqa"
-version = "0.8.1"
+version = "1.0.0"
 description = "DCAT-AP Cross-Version Validator for EU MQA: cross-version validation using the EU MQA SHACL validator"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -22,3 +22,8 @@ dcat-ap-cv = "src.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["src*"]
+
+
+[tool.setuptools.data-files]
+"queries/SQL" = ["queries/SQL/*.sql"]
+"queries/SPARQL" = ["queries/SPARQL/*.sparql"]

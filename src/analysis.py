@@ -16,6 +16,7 @@ import csv
 import json
 import re
 import sqlite3
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 from statistics import median
@@ -33,6 +34,17 @@ CATALOG_GRAPH_IRI = "urn:mqa:validation-catalog"
 
 SEVERITIES = ("Violation", "Warning", "Info")
 LEVEL_ORDER = {"all": 0, "level1": 1, "level2": 2, "level3": 3, "unknown": 4}
+
+# Canonical order shared by every analysis output. Measurements remain paired
+# with their ShapeModel; chart labels are never sorted independently.
+PROFILE_ORDER = (
+    "dcatap11", "dcatap12", "dcatap121", "dcatap201",
+    "dcatap210level1", "dcatap210",
+    "dcatap211level1", "dcatap211level2", "dcatap211level3", "dcatap211",
+    "dcatap300level1", "dcatap300level2", "dcatap300level3", "dcatap300",
+    "dcatap301level1", "dcatap301level2", "dcatap301level3", "dcatap301",
+)
+PROFILE_ORDER_INDEX = {profile: index for index, profile in enumerate(PROFILE_ORDER)}
 
 # Ordered profile chains used for the five comparative charts. Each adjacent
 # pair is compared on the same dataset and against the same validator endpoint.
@@ -112,17 +124,26 @@ def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
 
 
 def _profile_sort_key(shape_model: str) -> tuple[Any, ...]:
+    """Sort known ShapeModels in the canonical cross-version order."""
+    if shape_model in PROFILE_ORDER_INDEX:
+        return (0, PROFILE_ORDER_INDEX[shape_model])
     parsed = parse_shape_model(shape_model)
     if parsed is None:
-        return (1, (), LEVEL_ORDER["unknown"], shape_model)
+        return (2, (), LEVEL_ORDER["unknown"], shape_model)
     version, level = parsed
-    return (0, _version_key(version), LEVEL_ORDER.get(level, 99), shape_model)
+    return (1, _version_key(version), LEVEL_ORDER.get(level, 99), shape_model)
 
 
-def _filter_sql(column: str, value: str | None, clauses: list[str], params: list[Any]) -> None:
-    if value is not None:
-        clauses.append(f"{column} = ?")
-        params.append(value)
+def _read_analysis_query(relative_path: str) -> str:
+    """Read a version-controlled SQL/SPARQL query shipped with the project."""
+    query_path = Path(__file__).resolve().parent.parent / "queries" / relative_path
+    if not query_path.is_file():
+        # Wheel installations place the declared data-files under sys.prefix.
+        query_path = Path(sys.prefix) / "queries" / relative_path
+    try:
+        return query_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise AnalysisError(f"Query di analisi non leggibile: {query_path}") from exc
 
 
 def _load_quantitative_data(
@@ -147,51 +168,33 @@ def _load_quantitative_data(
         if missing:
             raise AnalysisError("Schema SQLite non compatibile; colonne mancanti: " + ", ".join(missing))
 
-        dataset_clauses = ["1=1"]
-        dataset_params: list[Any] = []
-        _filter_sql("catalogue_id", catalogue_id, dataset_clauses, dataset_params)
-        _filter_sql("category_id", category_id, dataset_clauses, dataset_params)
-        dataset_where = " AND ".join(dataset_clauses)
+        query_params = {
+            "catalogue_id": catalogue_id,
+            "category_id": category_id,
+        }
 
         datasets = conn.execute(
-            f"SELECT dataset_id, catalogue_id, category_id, fetch_status, fetch_http_status, fetch_error "
-            f"FROM datasets WHERE {dataset_where} ORDER BY dataset_id",
-            dataset_params,
+            _read_analysis_query("SQL/03-datasets-in-scope.sql"),
+            query_params,
         ).fetchall()
 
         # Keep all operational states for diagnostics. These rows are never
         # interpreted as SHACL non-conformity.
         operational_rows = conn.execute(
-            f"""SELECT v.execution_status, v.http_status, v.error, COUNT(*) AS count
-                FROM validations v JOIN datasets d ON d.dataset_id = v.dataset_id
-                WHERE {dataset_where.replace('catalogue_id', 'd.catalogue_id').replace('category_id', 'd.category_id')}
-                GROUP BY v.execution_status, v.http_status, v.error
-                ORDER BY v.execution_status, v.http_status""",
-            dataset_params,
+            _read_analysis_query("SQL/04-validation-operational-status.sql"),
+            query_params,
         ).fetchall()
 
-        # A row enters quantitative outcome statistics only if the validation
-        # completed successfully and SQLite contains a definite SHACL outcome.
-        # Report availability is deliberately not a condition: report RDF is
-        # not a quantitative source.
+        # Only completed HTTP 200 validations with a definite SHACL outcome
+        # and no execution error enter quantitative outcome statistics.
         validations = conn.execute(
-            f"""SELECT v.id, v.dataset_id, v.validator_url, v.shape_model, v.conforms,
-                       v.results, v.violations, v.warnings, v.infos, v.http_status,
-                       v.execution_status, v.validated_at, v.report_status
-                FROM validations v JOIN datasets d ON d.dataset_id = v.dataset_id
-                WHERE {dataset_where.replace('catalogue_id', 'd.catalogue_id').replace('category_id', 'd.category_id')}
-                  AND v.execution_status = 'validated'
-                  AND v.http_status = 200
-                  AND v.conforms IS NOT NULL
-                  AND (v.error IS NULL OR TRIM(v.error) = '')
-                ORDER BY v.shape_model, v.dataset_id, v.validator_url""",
-            dataset_params,
+            _read_analysis_query("SQL/05-successful-validations.sql"),
+            query_params,
         ).fetchall()
 
         total_validation_rows = conn.execute(
-            f"SELECT COUNT(*) FROM validations v JOIN datasets d ON d.dataset_id=v.dataset_id WHERE "
-            f"{dataset_where.replace('catalogue_id', 'd.catalogue_id').replace('category_id', 'd.category_id')}",
-            dataset_params,
+            _read_analysis_query("SQL/06-total-validation-rows.sql"),
+            query_params,
         ).fetchone()[0]
 
     return {
@@ -439,6 +442,13 @@ def _generate_quantitative_charts(
         raise AnalysisError("Per generare i grafici installare matplotlib e numpy") from exc
 
     generated: list[str] = []
+    # Enforce the canonical order at the plotting boundary as well, so every
+    # chart keeps each ShapeModel paired with its own measurements even when
+    # this helper is called with externally assembled rows.
+    profile_rows = sorted(
+        profile_rows,
+        key=lambda row: _profile_sort_key(str(row["shape_model"])),
+    )
     # Remove the previous chart names so an existing output directory cannot
     # retain obsolete bar charts next to the replacement line charts.
     for sequence_name in COMPARISON_SEQUENCES:
@@ -888,23 +898,7 @@ def _extract_qualitative_results(report: Mapping[str, Any], graph) -> list[dict[
 
 
 def _load_report_catalog(report_store) -> list[dict[str, Any]]:
-    query = f"""
-        PREFIX rdf: <{RDF}>
-        PREFIX mqa: <{MQA}>
-        SELECT ?reportGraph ?validationId ?datasetId ?shapeModel ?reportSha256 ?reportTriples ?storedAt
-        WHERE {{
-            GRAPH <{CATALOG_GRAPH_IRI}> {{
-                ?reportGraph rdf:type mqa:ValidationReport ;
-                             mqa:validationId ?validationId ;
-                             mqa:datasetId ?datasetId ;
-                             mqa:shapeModel ?shapeModel .
-                OPTIONAL {{ ?reportGraph mqa:reportSha256 ?reportSha256 }}
-                OPTIONAL {{ ?reportGraph mqa:reportTriples ?reportTriples }}
-                OPTIONAL {{ ?reportGraph mqa:storedAt ?storedAt }}
-            }}
-        }}
-        ORDER BY ?shapeModel ?datasetId ?validationId
-    """
+    query = _read_analysis_query("SPARQL/10-analysis-report-catalog.sparql")
     rows = _query_rows(report_store, query)
     # Group by graph IRI to avoid multiplying a report if catalog metadata has
     # accidentally been duplicated for a multi-valued metadata property.

@@ -17,6 +17,8 @@ from src.analysis import (
     _build_sequence_profile_count_rows,
     _generate_quantitative_charts,
     COMPARISON_SEQUENCES,
+    PROFILE_ORDER,
+    _profile_sort_key,
     _quantitative_profile_rows,
     load_qualitative_results,
     parse_shape_model,
@@ -123,6 +125,27 @@ def make_database(path: Path) -> None:
 
 
 class AnalysisTests(unittest.TestCase):
+    def test_canonical_profile_order_is_applied_to_shape_models_and_values(self):
+        shuffled = list(reversed(PROFILE_ORDER))
+        self.assertEqual(sorted(shuffled, key=_profile_sort_key), list(PROFILE_ORDER))
+
+        validations = [
+            {
+                "shape_model": profile,
+                "dataset_id": f"dataset-{index}",
+                "conforms": 1,
+                "violations": index,
+                "warnings": index * 2,
+                "infos": 0,
+                "results": index * 3,
+            }
+            for index, profile in enumerate(shuffled)
+        ]
+        rows = _quantitative_profile_rows(validations)
+        self.assertEqual([row["shape_model"] for row in rows], list(PROFILE_ORDER))
+        self.assertEqual([row["total_violations"] for row in rows],
+                         [shuffled.index(profile) for profile in PROFILE_ORDER])
+
     def test_parse_shape_model_uses_all_for_unsuffixed_profile(self):
         self.assertEqual(parse_shape_model("dcatap300"), ("3.0.0", "all"))
         self.assertEqual(parse_shape_model("dcatap211level2"), ("2.1.1", "level2"))

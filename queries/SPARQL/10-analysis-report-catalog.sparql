@@ -1,0 +1,17 @@
+# Catalogued report metadata consumed by qualitative analysis.
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX mqa: <urn:mqa:vocab:>
+
+SELECT ?reportGraph ?validationId ?datasetId ?shapeModel ?reportSha256 ?reportTriples ?storedAt
+WHERE {
+    GRAPH <urn:mqa:validation-catalog> {
+        ?reportGraph rdf:type mqa:ValidationReport ;
+                     mqa:validationId ?validationId ;
+                     mqa:datasetId ?datasetId ;
+                     mqa:shapeModel ?shapeModel .
+        OPTIONAL { ?reportGraph mqa:reportSha256 ?reportSha256 }
+        OPTIONAL { ?reportGraph mqa:reportTriples ?reportTriples }
+        OPTIONAL { ?reportGraph mqa:storedAt ?storedAt }
+    }
+}
+ORDER BY ?shapeModel ?datasetId ?validationId

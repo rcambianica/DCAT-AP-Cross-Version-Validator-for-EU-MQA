@@ -1,5 +1,7 @@
 # DCAT-AP Cross-Version Validator for EU MQA
 
+**Versione: 1.0.0**
+
 Strumento Python per la validazione cross-version dei metadati DCAT-AP dei dataset del catalogo `dati-gov-it` presenti nel piveau Hub di
 data.europa.eu. Le validazioni vengono eseguite tramite il validatore SHACL locale di EU MQA (`validating-shacl`); questo progetto ne
 orchestra le richieste e raccoglie i risultati.
@@ -368,7 +370,7 @@ GROUP BY ?shapeModel
 ORDER BY ?shapeModel
 ```
 
-Le query pronte sono disponibili nella directory `queries/SPARQL/`:
+Le query SPARQL pronte sono disponibili nella directory `queries/SPARQL/`:
 
 - `queries/SPARQL/01-reports-per-shape-model.sparql`: numero di report per modello;
 - `queries/SPARQL/02-results-per-shape-model.sparql`: numero totale di `sh:ValidationResult`;
@@ -376,7 +378,10 @@ Le query pronte sono disponibili nella directory `queries/SPARQL/`:
 - `queries/SPARQL/04-violations-per-shape-model.sparql`: sole `sh:Violation`;
 - `queries/SPARQL/05-constraint-components-per-shape-model.sparql`: risultati per componente SHACL;
 - `queries/SPARQL/06-result-paths-per-shape-model.sparql`: risultati per `sh:resultPath`;
-- `queries/SPARQL/07-reports-for-shape-model.sparql`: elenco report e metadati per un modello (sostituire il literal di esempio).
+- `queries/SPARQL/07-reports-for-shape-model.sparql`: elenco report e metadati per un modello (sostituire il literal di esempio);
+- `queries/SPARQL/08-reports-for-dataset.sparql`: metadati dei report associati a un dataset (sostituire `DATASET_ID`);
+- `queries/SPARQL/09-report-graphs-for-dataset.sparql`: triple dei named graph associati a un dataset (sostituire `DATASET_ID`);
+- `queries/SPARQL/10-analysis-report-catalog.sparql`: query effettivamente utilizzata da `analysis.py` per leggere il catalogo dei report.
 
 Le query possono essere eseguite direttamente tramite `ValidationReportStore.query()` oppure tramite un endpoint SPARQL collegato allo stesso store. I percorsi SHACL complessi e i blank node di `sh:resultPath` non devono essere interpretati come identificatori stabili tra report differenti.
 
@@ -594,7 +599,16 @@ Il modulo genera i seguenti CSV:
 - `paired_version_summary.csv`: numero di dataset con conteggi aumentati, diminuiti o invariati per coppia di versioni disponibili e livello.
 - `sequence_profile_counts.csv`: conteggi totali di violation e warning per ciascun profilo delle cinque sequenze comparative, insieme al numero di validazioni e dataset inclusi.
 
-Con i grafici abilitati e dati disponibili vengono generati i seguenti PNG:
+Con i grafici abilitati e dati disponibili vengono generati i seguenti PNG. I tre grafici aggregati per ShapeModel (`validation_outcomes.png`, `severity_totals.png` e `result_distributions.png`) condividono un ordine canonico esplicito, applicato alle righe complete dei dati prima del disegno: le etichette non vengono riordinate separatamente dai valori.
+
+```text
+dcatap11 -> dcatap12 -> dcatap121 -> dcatap201
+-> dcatap210level1 -> dcatap210
+-> dcatap211level1 -> dcatap211level2 -> dcatap211level3 -> dcatap211
+-> dcatap300level1 -> dcatap300level2 -> dcatap300level3 -> dcatap300
+-> dcatap301level1 -> dcatap301level2 -> dcatap301level3 -> dcatap301
+```
+
 
 1. `validation_outcomes.png`: distribuzione percentuale delle validazioni conformi (verde), non conformi con almeno una violation (rosso) e non conformi senza violation (giallo).
 2. `severity_totals.png`: conteggio complessivo per shape model, con violation in rosso, warning in arancione e info in giallo.
@@ -603,7 +617,7 @@ Con i grafici abilitati e dati disponibili vengono generati i seguenti PNG:
 
 `quantitative_summary.json` registra sorgente, filtri, dimensione del campione, validazioni incluse/escluse, confronti appaiati e grafici generati. `--no-charts` disabilita soltanto la produzione PNG, non i CSV.
 
-Sono disponibili anche query SQL di riferimento in `queries/SQL/`. Usano la stessa condizione di inclusione del ramo quantitativo (`execution_status='validated'`, HTTP 200, `conforms` valorizzato e nessun errore); non richiedono che il report RDF sia presente in Oxigraph, perché i conteggi quantitativi provengono da SQLite.
+Le query SQL sono disponibili in `queries/SQL/`. I file `01-general-stats-per-shape-model.sql` e `02-avg-violations-and-warning-per-dataset.sql` sono query esplorative di riepilogo. I file `03-datasets-in-scope.sql`, `04-validation-operational-status.sql`, `05-successful-validations.sql` e `06-total-validation-rows.sql` sono invece le query operative caricate direttamente da `analysis.py`. Queste ultime usano i parametri nominati `:catalogue_id` e `:category_id`; impostando un parametro a `NULL` il relativo filtro viene disabilitato. La query `05` applica la stessa condizione di inclusione del ramo quantitativo (`execution_status='validated'`, HTTP 200, `conforms` valorizzato e nessun errore). Non è richiesto che il report RDF sia presente in Oxigraph, perché i conteggi quantitativi provengono da SQLite.
 
 ### Output qualitativi
 
